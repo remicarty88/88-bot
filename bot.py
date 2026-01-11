@@ -2003,7 +2003,9 @@ async def _process_update(update: dict) -> None:
         # Do not track keyboard button presses (privacy-friendly)
 
         try:
-            if cq_id:
+            # Some internal UI refreshes simulate a callback_query without a real id.
+            # Telegram rejects invalid callback_query ids (e.g. "0").
+            if cq_id and str(cq_id) != "0":
                 await bot.answer_callback_query(str(cq_id))
         except Exception:
             logger.exception("Failed to answer callback_query")
@@ -2156,7 +2158,7 @@ async def _process_update(update: dict) -> None:
             cur = _db_get_paid_mode()
             _db_set_paid_mode(not cur)
             await bot.send_message(int(from_id), f"✅ Платный режим теперь: {'ВКЛ' if not cur else 'ВЫКЛ'}")
-            update2 = {"callback_query": {"id": "0", "data": "admin", "from": from_user}}
+            update2 = {"callback_query": {"data": "admin", "from": from_user}}
             await _process_update(update2)
             return
 
@@ -2283,7 +2285,7 @@ async def _process_update(update: dict) -> None:
                 return
             _db_set_free_user(uid, True)
             await bot.send_message(int(from_id), f"🎁 Пользователь {uid} теперь бесплатный")
-            update2 = {"callback_query": {"id": "0", "data": f"admin_u:{uid}", "from": from_user}}
+            update2 = {"callback_query": {"data": f"admin_u:{uid}", "from": from_user}}
             await _process_update(update2)
             return
 
@@ -2294,7 +2296,7 @@ async def _process_update(update: dict) -> None:
                 return
             _db_set_free_user(uid, False)
             await bot.send_message(int(from_id), f"💰 Пользователь {uid} убран из бесплатных")
-            update2 = {"callback_query": {"id": "0", "data": f"admin_u:{uid}", "from": from_user}}
+            update2 = {"callback_query": {"data": f"admin_u:{uid}", "from": from_user}}
             await _process_update(update2)
             return
 
