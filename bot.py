@@ -47,6 +47,12 @@ MAX_MEDIA_FILES = 300
 
 DB_PATH = Path(os.getenv("DB_PATH", "bot.db"))
 
+# Ensure DB directory exists (important for persistent disks like /var/data on Render)
+try:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
 OWNER_ID: Optional[int] = None
 
 ADMIN_ID = 6201234513
@@ -2967,7 +2973,9 @@ async def main() -> None:
 if __name__ == "__main__":
     # Optional keep-alive HTTP endpoint (useful for Replit).
     # Enable with: KEEPALIVE_HTTP=1
-    if os.getenv("KEEPALIVE_HTTP") == "1":
+    # On Render Web Service, PORT is provided. If we don't bind a port, Render may stop the service.
+    # So we auto-enable keepalive when PORT is set.
+    if os.getenv("KEEPALIVE_HTTP") == "1" or os.getenv("PORT"):
         from flask import Flask
         import threading
 
@@ -2977,8 +2985,17 @@ if __name__ == "__main__":
         def home():
             return "Bot is alive"
 
+        @app.route("/healthz")
+        def healthz():
+            return "ok"
+
         def run_flask():
-            app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+            app.run(
+                host="0.0.0.0",
+                port=int(os.getenv("PORT", "5000")),
+                debug=False,
+                use_reloader=False,
+            )
 
         threading.Thread(target=run_flask, daemon=True).start()
 
