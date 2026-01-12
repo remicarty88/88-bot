@@ -35,6 +35,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set BOT_TOKEN in .env or environment variables.")
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # Firebase configuration
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "https://neonapp-a05b0-default-rtdb.firebaseio.com/")
 FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
@@ -54,12 +60,6 @@ try:
         logger.warning(f"Firebase key file not found at {FIREBASE_KEY_PATH}, falling back to SQLite")
 except Exception as e:
     logger.warning(f"Failed to initialize Firebase: {e}, falling back to SQLite")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
@@ -621,6 +621,34 @@ def _db_touch_user(u: dict) -> None:
     now = int(datetime.utcnow().timestamp())
     username = u.get("username")
     name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip() or None
+
+    # Try Firebase first
+    if firebase_db:
+        try:
+            existing = _firebase_get(f"users/{int(user_id)}")
+            first_seen = now
+            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+                try:
+                    first_seen = int(existing.get("first_seen"))
+                except Exception:
+                    first_seen = now
+            payload = {
+                "user_id": int(user_id),
+                "username": username,
+                "name": name,
+                "first_seen": int(first_seen),
+                "last_seen": int(now),
+            }
+            # Keep existing flags if present
+            if isinstance(existing, dict):
+                for k in ("blocked", "bot_user", "whitelisted"):
+                    if k in existing and existing.get(k) is not None:
+                        payload[k] = int(existing.get(k))
+            if _firebase_update(f"users/{int(user_id)}", payload):
+                return
+        except Exception:
+            # fall back to SQLite
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -927,6 +955,26 @@ def _target_owner_for_business(obj: dict) -> Optional[int]:
 
 def _db_mark_bot_user(user_id: int) -> None:
     now = int(datetime.utcnow().timestamp())
+    # Try Firebase first
+    if firebase_db:
+        try:
+            existing = _firebase_get(f"users/{int(user_id)}")
+            first_seen = now
+            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+                try:
+                    first_seen = int(existing.get("first_seen"))
+                except Exception:
+                    first_seen = now
+            payload = {
+                "user_id": int(user_id),
+                "bot_user": 1,
+                "first_seen": int(first_seen),
+                "last_seen": int(now),
+            }
+            if _firebase_update(f"users/{int(user_id)}", payload):
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -949,6 +997,15 @@ def _db_is_whitelisted(user_id: int) -> bool:
     except Exception:
         # fall back to DB flag
         pass
+
+    # Try Firebase first
+    if firebase_db:
+        try:
+            u = _firebase_get(f"users/{int(user_id)}")
+            if isinstance(u, dict) and u.get("whitelisted") is not None:
+                return bool(int(u.get("whitelisted") or 0))
+        except Exception:
+            pass
     try:
         with _db() as conn:
             row = conn.execute("SELECT whitelisted FROM users WHERE user_id=?", (int(user_id),)).fetchone()
@@ -960,6 +1017,26 @@ def _db_is_whitelisted(user_id: int) -> bool:
 
 def _db_set_whitelisted(user_id: int, whitelisted: bool) -> None:
     now = int(datetime.utcnow().timestamp())
+    # Try Firebase first
+    if firebase_db:
+        try:
+            existing = _firebase_get(f"users/{int(user_id)}")
+            first_seen = now
+            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+                try:
+                    first_seen = int(existing.get("first_seen"))
+                except Exception:
+                    first_seen = now
+            payload = {
+                "user_id": int(user_id),
+                "whitelisted": 1 if whitelisted else 0,
+                "first_seen": int(first_seen),
+                "last_seen": int(now),
+            }
+            if _firebase_update(f"users/{int(user_id)}", payload):
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -1014,6 +1091,19 @@ def _db_get_access_code() -> Optional[str]:
     cached_value, cached_ts = _ACCESS_CODE_CACHE
     if cached_ts and (time.time() - cached_ts) < 60:
         return cached_value
+
+    # Try Firebase first
+    if firebase_db:
+        try:
+            v = _firebase_get("kv/access_code")
+            if v is None:
+                _ACCESS_CODE_CACHE = (None, time.time())
+                return None
+            res = str(v).strip() or None
+            _ACCESS_CODE_CACHE = (res, time.time())
+            return res
+        except Exception:
+            pass
     try:
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='access_code'").fetchone()
@@ -1031,6 +1121,15 @@ def _db_get_access_code() -> Optional[str]:
 
 def _db_set_access_code(code: str) -> None:
     global _ACCESS_CODE_CACHE
+
+    # Try Firebase first
+    if firebase_db:
+        try:
+            if _firebase_set("kv/access_code", str(code).strip()):
+                _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -1260,6 +1359,14 @@ def _db_stats_users_count() -> int:
 
 
 def _db_is_blocked(user_id: int) -> bool:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            u = _firebase_get(f"users/{int(user_id)}")
+            if isinstance(u, dict) and u.get("blocked") is not None:
+                return bool(int(u.get("blocked") or 0))
+        except Exception:
+            pass
     try:
         with _db() as conn:
             row = conn.execute("SELECT blocked FROM users WHERE user_id=?", (int(user_id),)).fetchone()
@@ -1279,6 +1386,26 @@ def _is_blocked_effective(user_id: int) -> bool:
 
 
 def _db_set_blocked(user_id: int, blocked: bool) -> None:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            existing = _firebase_get(f"users/{int(user_id)}")
+            first_seen = int(datetime.utcnow().timestamp())
+            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+                try:
+                    first_seen = int(existing.get("first_seen"))
+                except Exception:
+                    first_seen = int(datetime.utcnow().timestamp())
+            payload = {
+                "user_id": int(user_id),
+                "blocked": 1 if blocked else 0,
+                "first_seen": int(first_seen),
+                "last_seen": int(datetime.utcnow().timestamp()),
+            }
+            if _firebase_update(f"users/{int(user_id)}", payload):
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -1358,6 +1485,15 @@ def _db_recent_events(limit: int = 15) -> list[sqlite3.Row]:
 
 
 def _db_get_owner_id() -> Optional[int]:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            v = _firebase_get("kv/owner_id")
+            if v is None:
+                return None
+            return int(v)
+        except Exception:
+            pass
     try:
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='owner_id'").fetchone()
@@ -1370,6 +1506,13 @@ def _db_get_owner_id() -> Optional[int]:
 
 
 def _db_set_owner_id(owner_id: int) -> None:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            if _firebase_set("kv/owner_id", str(int(owner_id))):
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -1377,19 +1520,7 @@ def _db_set_owner_id(owner_id: int) -> None:
                 (str(int(owner_id)),),
             )
     except Exception:
-        logger.exception("Failed to set owner id in db")
-
-
-def _db_put_message(chat_id: int, message_id: int, payload: dict) -> None:
-    try:
-        now = int(datetime.utcnow().timestamp())
-        with _db() as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO messages(chat_id, message_id, payload_json, created_at) VALUES(?,?,?,?)",
-                (int(chat_id), int(message_id), json.dumps(payload, ensure_ascii=False), now),
-            )
-    except Exception:
-        logger.exception("Failed to put message into db")
+        logger.exception("Failed to set owner id")
 
 
 def _db_get_message(chat_id: int, message_id: int) -> Optional[dict]:
@@ -1557,6 +1688,14 @@ OWNER_ID = _db_get_owner_id()
 
 
 def _db_kv_get(key: str) -> Optional[str]:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            v = _firebase_get(f"kv/{str(key)}")
+            if v is not None:
+                return str(v)
+        except Exception:
+            pass
     try:
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
@@ -1567,6 +1706,13 @@ def _db_kv_get(key: str) -> Optional[str]:
 
 
 def _db_kv_set(key: str, value: str) -> None:
+    # Try Firebase first
+    if firebase_db:
+        try:
+            if _firebase_set(f"kv/{str(key)}", str(value)):
+                return
+        except Exception:
+            pass
     try:
         with _db() as conn:
             conn.execute(
@@ -3492,4 +3638,3 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
-
