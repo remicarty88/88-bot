@@ -571,6 +571,44 @@ def _db_sub_extend(user_id: int, seconds: int) -> int:
     return new_until
 
 
+def _db_sub_start_trial_if_needed(user_id: int, seconds: int) -> int:
+    if int(user_id) == int(ADMIN_ID):
+        return _db_sub_get_paid_until(int(user_id))
+    now = int(datetime.utcnow().timestamp())
+    cur = _db_sub_get_paid_until(int(user_id))
+    if int(cur) > 0:
+        return int(cur)
+    new_until = int(now + int(seconds))
+    try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            row = _rtdb_get(f"subscriptions/{uid}")
+            if isinstance(row, dict) and row.get("paid_until") is not None:
+                try:
+                    return int(row.get("paid_until") or 0)
+                except Exception:
+                    return 0
+            _rtdb_put(
+                f"subscriptions/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "paid_until": int(new_until),
+                    "created_at": int(now),
+                    "updated_at": int(now),
+                },
+            )
+            return int(new_until)
+        with _db() as conn:
+            conn.execute(
+                "INSERT INTO subscriptions(user_id, paid_until, created_at, updated_at) VALUES(?, ?, ?, ?) "
+                "ON CONFLICT(user_id) DO NOTHING",
+                (int(user_id), int(new_until), int(now), int(now)),
+            )
+    except Exception:
+        logger.exception("Failed to start trial")
+    return int(new_until)
+
+
 def _has_active_subscription(user_id: int) -> bool:
     if int(user_id) == int(ADMIN_ID):
         return True
@@ -1256,12 +1294,12 @@ def _db_list_bot_user_ids() -> list[int]:
 async def _send_help(chat_id: int) -> None:
     bot_username = await _get_bot_username()
     text = (
-        "📌 Инструкция\n\n"
-        "Важно: для работы бизнес-чатботов нужен <b>Telegram Premium</b> (функция <b>Telegram для бизнеса</b>).\n\n"
-        "1) Откройте Telegram → <b>Telegram для бизнеса</b>\n"
-        "2) Перейдите в <b>Чат-боты</b>\n"
+        "📌 Подключение\n\n"
+        "Условие: нужен <b>Telegram Premium</b> и включённый <b>Telegram для бизнеса</b>.\n\n"
+        "1) Telegram → <b>Telegram для бизнеса</b>\n"
+        "2) <b>Чат-боты</b>\n"
         f"3) Добавьте <code>@{bot_username}</code>\n\n"
-        "После этого просто начните переписку (вы можете написать кому-то сами или вам могут написать) — бот начнёт получать бизнес-апдейты."
+        "Готово: начните переписку от имени бизнеса — бот автоматически начнёт фиксировать события."
     )
     await bot.send_message(int(chat_id), text)
 
@@ -1282,18 +1320,18 @@ async def _send_status(chat_id: int) -> None:
     chats_count = _db_owner_chat_count(int(chat_id))
     wl = _db_is_whitelisted(int(chat_id))
 
-    lines = ["📊 Статус", "", f"• Ваш ID: {int(chat_id)}"]
-    lines.append(f"• Доступ: {'✅ открыт' if wl or is_admin else '🔐 закрыт'}")
+    lines = ["📊 Статус", "", f"• ID: {int(chat_id)}"]
+    lines.append(f"• Доступ: {'✅ активен' if wl or is_admin else '🔐 ограничен'}")
     if int(chat_id) == int(ADMIN_ID):
-        lines.append("• Подписка: 👑 админ (бесплатно)")
+        lines.append("• Подписка: 👑 админ")
     else:
         until = _db_sub_get_paid_until(int(chat_id))
         if until > int(datetime.utcnow().timestamp()):
-            lines.append(f"• Подписка: ✅ активна до {_fmt_dt(until)}")
+            lines.append(f"• Подписка: ✅ до {_fmt_dt(until)}")
         else:
-            lines.append("• Подписка: ❌ нет")
-    lines.append(f"• Бизнес-подключений (для вашего аккаунта): {connections_count}")
-    lines.append(f"• Подключённые бизнес-чаты (для вашего аккаунта): {chats_count}")
+            lines.append("• Подписка: ❌ не активна")
+    lines.append(f"• Бизнес-подключений: {connections_count}")
+    lines.append(f"• Бизнес-чатов: {chats_count}")
 
     if is_admin:
         owner = _db_get_owner_id()
@@ -2176,12 +2214,13 @@ async def _send_start(chat_id: int, *, set_owner: bool) -> None:
     menu = _main_menu_kb(is_admin=is_admin)
     await _send_premium_header(chat_id, "Добро пожаловать!")
     text = (
-        "🕵️‍♂️ Этот бот помогает следить за вашими бизнес-чатами.\n\n"
-        "Что он умеет:\n"
-        "• Уведомляет об изменениях сообщений ✏️\n"
-        "• Уведомляет об удалениях 🗑\n"
-        "• Сохраняет исчезающие фото/видео при ответе ⏳\n\n"
-        "Подключение: Telegram → Telegram для бизнеса → Чат-боты → добавить:\n"
+        "<b>Контроль ваших бизнес-чатов</b> — аккуратно и без лишнего шума.\n\n"
+        "Возможности:\n"
+        "• изменения сообщений\n"
+        "• удаление сообщений\n"
+        "• сохранение исчезающих фото/видео (при ответе)\n\n"
+        "<b>Как подключить</b>\n"
+        "Telegram → Telegram для бизнеса → Чат-боты → добавить:\n"
         f"<code>@{bot_username}</code>"
     )
     await bot.send_message(chat_id, text, reply_markup=menu)
@@ -2190,12 +2229,13 @@ async def _send_start(chat_id: int, *, set_owner: bool) -> None:
     if my_connections > 0:
         await bot.send_message(
             chat_id,
-            f"✅ Бот подключён в Telegram для бизнеса. Подключений: {my_connections}. Чатов: {my_chats}.",
+            f"✅ Подключение активно. Бизнес-подключений: {my_connections}. Чатов: {my_chats}.",
         )
     else:
         await bot.send_message(
             chat_id,
-            f"❗️ Пока нет подключённых бизнес-чатов. Добавьте @{bot_username} в Telegram для бизнеса → Чат-боты и начните переписку (вы можете написать кому-то сами).",
+            "Чтобы начать — подключите Telegram для бизнеса и отправьте любое первое сообщение от имени бизнеса.\n"
+            f"Бот для подключения: <code>@{bot_username}</code>",
         )
 
 
@@ -2747,15 +2787,15 @@ async def _process_update(update: dict) -> None:
                     txt_raw = (m.get("text") or "").strip()
                     if txt_raw == "/start":
                         _db_access_set_pending(int(chat_id), True, "user")
-                        await bot.send_message(int(chat_id), "🔐 Введите код доступа")
+                        await bot.send_message(int(chat_id), "🔐 Введите код доступа, чтобы открыть доступ")
                         return
 
                     if txt == "⭐ Купить доступ":
                         kb = _stars_buttons()
-                        await _send_premium_header(int(chat_id), "Оплата Telegram Stars")
+                        await _send_premium_header(int(chat_id), "Оплата")
                         await bot.send_message(
                             int(chat_id),
-                            "Выберите тариф. Оплата проходит в Telegram Stars.",
+                            "Выберите тариф. Оплата проходит внутри Telegram (Stars).",
                             reply_markup=kb,
                         )
                         return
@@ -2763,15 +2803,15 @@ async def _process_update(update: dict) -> None:
                     if pending_kind == "user":
                         code = _db_get_access_code()
                         if not code:
-                            await bot.send_message(int(chat_id), "⛔️ Доступ закрыт.")
+                            await bot.send_message(int(chat_id), "⛔️ Доступ временно закрыт. Обратитесь к администратору.")
                             return
                         if txt_raw == code:
                             _db_access_set_pending(int(chat_id), False, "user")
                             _db_set_whitelisted(int(chat_id), True)
-                            await bot.send_message(int(chat_id), "✅ Доступ открыт")
+                            await bot.send_message(int(chat_id), "✅ Готово. Доступ открыт.")
                             await _send_start(int(chat_id), set_owner=False)
                             return
-                        await bot.send_message(int(chat_id), "❌ Неверный код")
+                        await bot.send_message(int(chat_id), "❌ Код не подошёл. Попробуйте ещё раз")
                         return
 
                     await bot.send_message(int(chat_id), "🔐 Для доступа нажмите /start и введите код")
@@ -2809,9 +2849,19 @@ async def _process_update(update: dict) -> None:
                     if txt == "🔗 Подключить бизнес":
                         if not _has_active_subscription(int(chat_id)):
                             kb = _stars_buttons()
+                            try:
+                                until = _db_sub_get_paid_until(int(chat_id))
+                                now_ts = int(datetime.utcnow().timestamp())
+                                if int(until) > 0 and int(until) <= int(now_ts):
+                                    await bot.send_message(
+                                        int(chat_id),
+                                        "⏳ Доступ завершён. Чтобы продолжить — выберите тариф:",
+                                    )
+                            except Exception:
+                                logger.exception("Failed to send trial expired message")
                             await bot.send_message(
                                 int(chat_id),
-                                "⭐ Для подключения бизнеса нужен активный доступ. Выберите тариф:",
+                                "⭐ Для подключения Telegram для бизнеса нужен активный доступ. Выберите тариф:",
                                 reply_markup=kb,
                             )
                             return
@@ -2827,9 +2877,9 @@ async def _process_update(update: dict) -> None:
                         await _send_premium_header(int(chat_id), "Подключение Telegram для бизнеса")
                         await bot.send_message(
                             int(chat_id),
-                            "1) Убедитесь, что бот добавлен: Telegram → Telegram для бизнеса → Чат-боты\n"
-                            "2) Затем напишите любому человеку от имени бизнеса (или вам напишут)\n\n"
-                            "После первого сообщения бот привяжет ваш бизнес-аккаунт и начнёт присылать уведомления только по вашим чатам.",
+                            "1) Telegram → Telegram для бизнеса → <b>Чат-боты</b> → добавьте этого бота\n"
+                            "2) Отправьте любое сообщение от имени бизнеса (или дождитесь входящего)\n\n"
+                            "После первого сообщения я привяжу бизнес-аккаунт и начну присылать уведомления только по вашим чатам.",
                         )
                         return
                     if txt == "📣 Рассылка" and int(chat_id) == int(ADMIN_ID):
@@ -2856,7 +2906,7 @@ async def _process_update(update: dict) -> None:
                         cur = _db_get_access_code()
                         await bot.send_message(
                             int(chat_id),
-                            f"🔑 Текущий код: {cur if cur else '[не задан]'}\n\nОтправь новый код одним сообщением.",
+                            f"🔑 Код доступа: {cur if cur else '[не задан]'}\n\nОтправьте новый код одним сообщением.",
                         )
                         _db_access_set_pending(int(chat_id), True, "admin")
                         return
@@ -3025,6 +3075,13 @@ async def _process_update(update: dict) -> None:
             if sender and isinstance(sender, dict) and sender.get("id"):
                 _db_log_event(user_id=int(sender.get("id")), action="start")
             # Only the main admin can register/set the OWNER_ID.
+            try:
+                chat_obj = m.get("chat") or {}
+                if chat_obj.get("type") == "private":
+                    if int(chat_id) != int(ADMIN_ID) and _db_is_whitelisted(int(chat_id)):
+                        _db_sub_start_trial_if_needed(int(chat_id), 3 * 24 * 60 * 60)
+            except Exception:
+                logger.exception("Failed to start trial on /start")
             await _send_start(int(chat_id), set_owner=(int(chat_id) == int(ADMIN_ID)))
 
     # Business edit notification (main target)
@@ -3301,4 +3358,3 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
-
