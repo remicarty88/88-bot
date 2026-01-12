@@ -12,8 +12,13 @@ import time
 import aiohttp
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramForbiddenError
-import firebase_admin
-from firebase_admin import credentials, db
+try:
+    import firebase_admin
+    from firebase_admin import credentials, db
+except ModuleNotFoundError:
+    firebase_admin = None
+    credentials = None
+    db = None
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -35,6 +40,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set BOT_TOKEN in .env or environment variables.")
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
+
 # Firebase configuration
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "https://neonapp-a05b0-default-rtdb.firebaseio.com/")
 FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
@@ -43,7 +54,7 @@ FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
 firebase_creds = None
 firebase_db = None
 try:
-    if os.path.exists(FIREBASE_KEY_PATH):
+    if firebase_admin and credentials and db and os.path.exists(FIREBASE_KEY_PATH):
         cred = credentials.Certificate(FIREBASE_KEY_PATH)
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DATABASE_URL
@@ -54,12 +65,6 @@ try:
         logger.warning(f"Firebase key file not found at {FIREBASE_KEY_PATH}, falling back to SQLite")
 except Exception as e:
     logger.warning(f"Failed to initialize Firebase: {e}, falling back to SQLite")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
 
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
