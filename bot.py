@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import sqlite3
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -12,8 +14,6 @@ import time
 import aiohttp
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramForbiddenError
-import firebase_admin
-from firebase_admin import credentials, db
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -41,26 +41,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Firebase configuration
-FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "https://neonapp-a05b0-default-rtdb.firebaseio.com/")
-FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
-
-# Initialize Firebase
-firebase_creds = None
-firebase_db = None
-try:
-    if os.path.exists(FIREBASE_KEY_PATH):
-        cred = credentials.Certificate(FIREBASE_KEY_PATH)
-        firebase_admin.initialize_app(cred, {
-            'databaseURL': FIREBASE_DATABASE_URL
-        })
-        firebase_db = db.reference()
-        logger.info("Firebase initialized successfully")
-    else:
-        logger.warning(f"Firebase key file not found at {FIREBASE_KEY_PATH}, falling back to SQLite")
-except Exception as e:
-    logger.warning(f"Failed to initialize Firebase: {e}, falling back to SQLite")
-
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 
@@ -68,12 +48,6 @@ MAX_MESSAGES_PER_CHAT = 500
 MAX_MEDIA_FILES = 300
 
 DB_PATH = Path(os.getenv("DB_PATH", "bot.db"))
-
-# Ensure DB directory exists (important for persistent disks like /var/data on Render)
-try:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
 
 OWNER_ID: Optional[int] = None
 
@@ -89,7 +63,8 @@ STARS_DURATIONS: dict[str, int] = {
 }
 DEFAULT_STARS_PRICES: dict[str, int] = {"7d": 15, "14d": 25, "30d": 45}
 
-REF_COUPON_KIND_14D_50 = "ref50_14d"
+FIREBASE_DB_URL = (os.getenv("FIREBASE_DB_URL") or "").strip().rstrip("/")
+FIREBASE_DB_TOKEN = (os.getenv("FIREBASE_DB_TOKEN") or "").strip()
 
 # Dedup notifications (prevents double sends when Telegram delivers the same business event twice)
 _RECENT_NOTIFY: dict[tuple[Any, ...], float] = {}
@@ -106,6 +81,7 @@ def _conv_pair(a: Optional[int], b: Optional[int]) -> Optional[tuple[int, int]]:
         return None
     return (a_i, b_i) if a_i <= b_i else (b_i, a_i)
 
+
 SUPPORT_CHAT_ID = -5226762204
 
 connected_chats: set[int] = set()
@@ -118,54 +94,6 @@ _ACCESS_CODE_CACHE: tuple[Optional[str], float] = (None, 0.0)
 _DEBUG_LAST_BUSINESS_UPDATE_ID: Optional[int] = None
 
 
-# Firebase helper functions
-def _firebase_get(path: str) -> Optional[Any]:
-    """Get data from Firebase"""
-    if not firebase_db:
-        return None
-    try:
-        ref = firebase_db.child(path)
-        return ref.get()
-    except Exception as e:
-        logger.warning(f"Firebase get error at {path}: {e}")
-        return None
-
-def _firebase_set(path: str, data: Any) -> bool:
-    """Set data in Firebase"""
-    if not firebase_db:
-        return False
-    try:
-        ref = firebase_db.child(path)
-        ref.set(data)
-        return True
-    except Exception as e:
-        logger.warning(f"Firebase set error at {path}: {e}")
-        return False
-
-def _firebase_update(path: str, data: Any) -> bool:
-    """Update data in Firebase"""
-    if not firebase_db:
-        return False
-    try:
-        ref = firebase_db.child(path)
-        ref.update(data)
-        return True
-    except Exception as e:
-        logger.warning(f"Firebase update error at {path}: {e}")
-        return False
-
-def _firebase_delete(path: str) -> bool:
-    """Delete data from Firebase"""
-    if not firebase_db:
-        return False
-    try:
-        ref = firebase_db.child(path)
-        ref.delete()
-        return True
-    except Exception as e:
-        logger.warning(f"Firebase delete error at {path}: {e}")
-        return False
-
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
@@ -177,6 +105,126 @@ def _db() -> sqlite3.Connection:
         # Best-effort pragmas
         pass
     return conn
+
+
+def _rtdb_enabled() -> bool:
+    return bool(FIREBASE_DB_URL)
+
+
+def _rtdb_url(path: str) -> str:
+    p = str(path).strip().lstrip("/")
+    url = f"{FIREBASE_DB_URL}/{p}.json"
+    if FIREBASE_DB_TOKEN:
+        url += "?" + urllib.parse.urlencode({"auth": FIREBASE_DB_TOKEN})
+    return url
+
+
+def _rtdb_request(method: str, path: str, data: Optional[Any] = None) -> Any:
+    url = _rtdb_url(path)
+    body: Optional[bytes] = None
+    if data is not None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method=str(method).upper(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _rtdb_get(path: str) -> Any:
+    try:
+        return _rtdb_request("GET", path)
+    except Exception:
+        logger.exception("RTDB GET failed: %s", path)
+        return None
+
+
+def _rtdb_put(path: str, data: Any) -> bool:
+    try:
+        _rtdb_request("PUT", path, data)
+        return True
+    except Exception:
+        logger.exception("RTDB PUT failed: %s", path)
+        return False
+
+
+def _rtdb_delete(path: str) -> bool:
+    try:
+        _rtdb_request("DELETE", path, None)
+        return True
+    except Exception:
+        logger.exception("RTDB DELETE failed: %s", path)
+        return False
+
+
+def _rtdb_bootstrap_from_sqlite_if_empty() -> None:
+    if not _rtdb_enabled():
+        return
+    try:
+        existing_kv = _rtdb_get("kv")
+        if isinstance(existing_kv, dict) and existing_kv:
+            return
+    except Exception:
+        return
+
+    try:
+        with _db() as conn:
+            kv_rows = conn.execute("SELECT key, value FROM kv").fetchall()
+            for r in kv_rows:
+                _rtdb_put(f"kv/{str(r['key'])}", str(r["value"]))
+
+            user_rows = conn.execute(
+                "SELECT user_id, username, name, first_seen, last_seen, blocked, bot_user, whitelisted FROM users"
+            ).fetchall()
+            for r in user_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"users/{uid}",
+                    {
+                        "user_id": int(r["user_id"]),
+                        "username": r["username"],
+                        "name": r["name"],
+                        "first_seen": int(r["first_seen"]),
+                        "last_seen": int(r["last_seen"]),
+                        "blocked": int(r["blocked"]),
+                        "bot_user": int(r["bot_user"]),
+                        "whitelisted": int(r["whitelisted"]),
+                    },
+                )
+
+            sub_rows = conn.execute(
+                "SELECT user_id, paid_until, created_at, updated_at FROM subscriptions"
+            ).fetchall()
+            for r in sub_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"subscriptions/{uid}",
+                    {
+                        "user_id": int(r["user_id"]),
+                        "paid_until": int(r["paid_until"]),
+                        "created_at": int(r["created_at"]),
+                        "updated_at": int(r["updated_at"]),
+                    },
+                )
+
+            free_rows = conn.execute("SELECT user_id, created_at FROM free_users").fetchall()
+            for r in free_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"free_users/{uid}",
+                    {"user_id": int(r["user_id"]), "created_at": int(r["created_at"])},
+                )
+
+        _rtdb_put("meta/bootstrapped_at", int(datetime.utcnow().timestamp()))
+        logger.info("RTDB bootstrapped from SQLite")
+    except Exception:
+        logger.exception("Failed to bootstrap RTDB from SQLite")
 
 
 async def _get_bot_username() -> str:
@@ -195,31 +243,6 @@ def _db_init() -> None:
             CREATE TABLE IF NOT EXISTS kv (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referrals (
-                invited_user_id INTEGER PRIMARY KEY,
-                inviter_user_id INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_referrals_inviter ON referrals(inviter_user_id)"
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referral_coupons (
-                user_id INTEGER NOT NULL,
-                kind TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                used_at INTEGER,
-                PRIMARY KEY(user_id, kind)
             )
             """
         )
@@ -420,17 +443,10 @@ def _db_init() -> None:
 
 
 def _db_get_paid_mode() -> bool:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            value = _firebase_get("kv/paid_mode")
-            if value is not None:
-                return str(value).strip() in {"1", "true", "yes"}
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get("kv/paid_mode")
+            return bool(int(row or 0))
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='paid_mode'").fetchone()
             if not row:
@@ -442,36 +458,24 @@ def _db_get_paid_mode() -> bool:
 
 
 def _db_set_paid_mode(enabled: bool) -> None:
-    value = "1" if enabled else "0"
-    
-    # Try Firebase first
-    if firebase_db:
-        if _firebase_set("kv/paid_mode", value):
-            return
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/paid_mode", "1" if enabled else "0")
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('paid_mode', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (value,),
+                ("1" if enabled else "0",),
             )
     except Exception:
         logger.exception("Failed to set paid_mode")
 
 
 def _db_is_free_user(user_id: int) -> bool:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get(f"free_users/{user_id}")
-            if data is not None:
-                return True
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"free_users/{int(user_id)}")
+            return bool(row)
         with _db() as conn:
             row = conn.execute("SELECT 1 FROM free_users WHERE user_id=?", (int(user_id),)).fetchone()
             return row is not None
@@ -481,20 +485,16 @@ def _db_is_free_user(user_id: int) -> bool:
 
 
 def _db_set_free_user(user_id: int, enabled: bool) -> None:
-    # Try Firebase first
-    if firebase_db:
-        if enabled:
-            data = {
-                "created_at": int(datetime.utcnow().timestamp())
-            }
-            if _firebase_set(f"free_users/{user_id}", data):
-                return
-        else:
-            if _firebase_delete(f"free_users/{user_id}"):
-                return
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            if enabled:
+                _rtdb_put(
+                    f"free_users/{int(user_id)}",
+                    {"user_id": int(user_id), "created_at": int(datetime.utcnow().timestamp())},
+                )
+            else:
+                _rtdb_delete(f"free_users/{int(user_id)}")
+            return
         with _db() as conn:
             if enabled:
                 conn.execute(
@@ -508,20 +508,12 @@ def _db_set_free_user(user_id: int, enabled: bool) -> None:
 
 
 def _db_list_free_users(limit: int = 50) -> list[int]:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get("free_users")
-            if data and isinstance(data, dict):
-                # Sort by created_at descending and limit
-                users = [(int(uid), info.get("created_at", 0)) for uid, info in data.items()]
-                users.sort(key=lambda x: x[1], reverse=True)
-                return [uid for uid, _ in users[:limit]]
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            rows = _rtdb_get("free_users")
+            if not rows:
+                return []
+            return [int(r["user_id"]) for r in rows.values()]
         with _db() as conn:
             rows = conn.execute(
                 "SELECT user_id FROM free_users ORDER BY created_at DESC LIMIT ?",
@@ -534,17 +526,10 @@ def _db_list_free_users(limit: int = 50) -> list[int]:
 
 
 def _db_sub_get_paid_until(user_id: int) -> int:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get(f"subscriptions/{user_id}")
-            if data and "paid_until" in data:
-                return int(data["paid_until"])
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"subscriptions/{int(user_id)}")
+            return int(row.get("paid_until") or 0)
         with _db() as conn:
             row = conn.execute("SELECT paid_until FROM subscriptions WHERE user_id=?", (int(user_id),)).fetchone()
             return int(row["paid_until"]) if row else 0
@@ -558,19 +543,18 @@ def _db_sub_extend(user_id: int, seconds: int) -> int:
     cur = _db_sub_get_paid_until(int(user_id))
     base = cur if cur > now else now
     new_until = int(base + int(seconds))
-    
-    # Try Firebase first
-    if firebase_db:
-        data = {
-            "paid_until": new_until,
-            "created_at": now,
-            "updated_at": now
-        }
-        if _firebase_set(f"subscriptions/{user_id}", data):
-            return new_until
-    
-    # Fallback to SQLite
     try:
+        if _rtdb_enabled():
+            _rtdb_put(
+                f"subscriptions/{int(user_id)}",
+                {
+                    "user_id": int(user_id),
+                    "paid_until": int(new_until),
+                    "created_at": int(now),
+                    "updated_at": int(now),
+                },
+            )
+            return new_until
         with _db() as conn:
             conn.execute(
                 """
@@ -621,35 +605,30 @@ def _db_touch_user(u: dict) -> None:
     now = int(datetime.utcnow().timestamp())
     username = u.get("username")
     name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip() or None
-
-    # Try Firebase first
-    if firebase_db:
-        try:
-            existing = _firebase_get(f"users/{int(user_id)}")
+    try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
             first_seen = now
-            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
                 try:
-                    first_seen = int(existing.get("first_seen"))
+                    first_seen = int(prev.get("first_seen") or now)
                 except Exception:
                     first_seen = now
-            payload = {
-                "user_id": int(user_id),
-                "username": username,
-                "name": name,
-                "first_seen": int(first_seen),
-                "last_seen": int(now),
-            }
-            # Keep existing flags if present
-            if isinstance(existing, dict):
-                for k in ("blocked", "bot_user", "whitelisted"):
-                    if k in existing and existing.get(k) is not None:
-                        payload[k] = int(existing.get(k))
-            if _firebase_update(f"users/{int(user_id)}", payload):
-                return
-        except Exception:
-            # fall back to SQLite
-            pass
-    try:
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": username,
+                    "name": name,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 """
@@ -733,6 +712,9 @@ def _db_upsert_business_connection_safe(connection_id: str, owner_user_id: int) 
 def _db_is_bot_user(user_id: int) -> bool:
     """True if user has interacted with bot in private chat (so bot can PM them)."""
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            return bool(int(row.get("bot_user") or 0))
         with _db() as conn:
             row = conn.execute("SELECT bot_user FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["bot_user"]) if row else False
@@ -955,27 +937,30 @@ def _target_owner_for_business(obj: dict) -> Optional[int]:
 
 def _db_mark_bot_user(user_id: int) -> None:
     now = int(datetime.utcnow().timestamp())
-    # Try Firebase first
-    if firebase_db:
-        try:
-            existing = _firebase_get(f"users/{int(user_id)}")
+    try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
             first_seen = now
-            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
                 try:
-                    first_seen = int(existing.get("first_seen"))
+                    first_seen = int(prev.get("first_seen") or now)
                 except Exception:
                     first_seen = now
-            payload = {
-                "user_id": int(user_id),
-                "bot_user": 1,
-                "first_seen": int(first_seen),
-                "last_seen": int(now),
-            }
-            if _firebase_update(f"users/{int(user_id)}", payload):
-                return
-        except Exception:
-            pass
-    try:
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": 1,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, bot_user, first_seen, last_seen) VALUES(?, 1, ?, ?) "
@@ -997,16 +982,12 @@ def _db_is_whitelisted(user_id: int) -> bool:
     except Exception:
         # fall back to DB flag
         pass
-
-    # Try Firebase first
-    if firebase_db:
-        try:
-            u = _firebase_get(f"users/{int(user_id)}")
-            if isinstance(u, dict) and u.get("whitelisted") is not None:
-                return bool(int(u.get("whitelisted") or 0))
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            if isinstance(row, dict) and row.get("whitelisted") is not None:
+                return bool(int(row.get("whitelisted") or 0))
+            return False
         with _db() as conn:
             row = conn.execute("SELECT whitelisted FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["whitelisted"]) if row else False
@@ -1017,27 +998,30 @@ def _db_is_whitelisted(user_id: int) -> bool:
 
 def _db_set_whitelisted(user_id: int, whitelisted: bool) -> None:
     now = int(datetime.utcnow().timestamp())
-    # Try Firebase first
-    if firebase_db:
-        try:
-            existing = _firebase_get(f"users/{int(user_id)}")
+    try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
             first_seen = now
-            if isinstance(existing, dict) and existing.get("first_seen") is not None:
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
                 try:
-                    first_seen = int(existing.get("first_seen"))
+                    first_seen = int(prev.get("first_seen") or now)
                 except Exception:
                     first_seen = now
-            payload = {
-                "user_id": int(user_id),
-                "whitelisted": 1 if whitelisted else 0,
-                "first_seen": int(first_seen),
-                "last_seen": int(now),
-            }
-            if _firebase_update(f"users/{int(user_id)}", payload):
-                return
-        except Exception:
-            pass
-    try:
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": 1 if whitelisted else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, whitelisted, first_seen, last_seen) VALUES(?, ?, ?, ?) "
@@ -1091,20 +1075,15 @@ def _db_get_access_code() -> Optional[str]:
     cached_value, cached_ts = _ACCESS_CODE_CACHE
     if cached_ts and (time.time() - cached_ts) < 60:
         return cached_value
-
-    # Try Firebase first
-    if firebase_db:
-        try:
-            v = _firebase_get("kv/access_code")
+    try:
+        if _rtdb_enabled():
+            v = _rtdb_get("kv/access_code")
             if v is None:
                 _ACCESS_CODE_CACHE = (None, time.time())
                 return None
             res = str(v).strip() or None
             _ACCESS_CODE_CACHE = (res, time.time())
             return res
-        except Exception:
-            pass
-    try:
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='access_code'").fetchone()
             if not row:
@@ -1121,16 +1100,11 @@ def _db_get_access_code() -> Optional[str]:
 
 def _db_set_access_code(code: str) -> None:
     global _ACCESS_CODE_CACHE
-
-    # Try Firebase first
-    if firebase_db:
-        try:
-            if _firebase_set("kv/access_code", str(code).strip()):
-                _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
-                return
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/access_code", str(code).strip())
+            _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('access_code', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1235,7 +1209,6 @@ def _main_menu_kb(*, is_admin: bool) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🔒 Конфиденциальность"), KeyboardButton(text="🆘 Техподдержка")],
         [KeyboardButton(text="🔗 Подключить бизнес")],
         [KeyboardButton(text="⭐ Купить доступ")],
-        [KeyboardButton(text="👥 Рефералы")],
     ]
     if is_admin:
         rows.append([KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")])
@@ -1244,23 +1217,32 @@ def _main_menu_kb(*, is_admin: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
-async def _send_referrals(chat_id: int) -> None:
-    bot_username = await _get_bot_username()
-    cnt = _db_ref_count(int(chat_id))
-    link = f"https://t.me/{bot_username}?start=ref_{int(chat_id)}"
-    has_coupon = _db_ref_coupon_available(int(chat_id), REF_COUPON_KIND_14D_50)
-    txt = (
-        "👥 Рефералы\n\n"
-        f"Твоя ссылка:\n{link}\n\n"
-        f"Приглашено: {cnt} (нужно 2)\n"
-        "Награда: 50% скидка на тариф 14 дней (1 раз).\n\n"
-        f"Статус скидки: {'✅ доступна' if has_coupon else '❌ нет'}"
-    )
-    await bot.send_message(int(chat_id), txt)
-
-
 def _db_list_bot_user_ids() -> list[int]:
     try:
+        if _rtdb_enabled():
+            users = _rtdb_get("users") or {}
+            if not isinstance(users, dict):
+                return []
+            out: list[int] = []
+            for k, v in users.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    uid = int(v.get("user_id") or k)
+                except Exception:
+                    continue
+                try:
+                    if int(v.get("bot_user") or 0) != 1:
+                        continue
+                    if int(v.get("blocked") or 0) != 0:
+                        continue
+                    if int(v.get("whitelisted") or 0) != 1:
+                        continue
+                except Exception:
+                    continue
+                out.append(int(uid))
+            out.sort()
+            return out
         with _db() as conn:
             rows = conn.execute(
                 "SELECT user_id FROM users WHERE bot_user=1 AND blocked=0 AND whitelisted=1"
@@ -1359,15 +1341,10 @@ def _db_stats_users_count() -> int:
 
 
 def _db_is_blocked(user_id: int) -> bool:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            u = _firebase_get(f"users/{int(user_id)}")
-            if isinstance(u, dict) and u.get("blocked") is not None:
-                return bool(int(u.get("blocked") or 0))
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            return bool(int((row or {}).get("blocked") or 0))
         with _db() as conn:
             row = conn.execute("SELECT blocked FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["blocked"]) if row else False
@@ -1386,27 +1363,31 @@ def _is_blocked_effective(user_id: int) -> bool:
 
 
 def _db_set_blocked(user_id: int, blocked: bool) -> None:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            existing = _firebase_get(f"users/{int(user_id)}")
-            first_seen = int(datetime.utcnow().timestamp())
-            if isinstance(existing, dict) and existing.get("first_seen") is not None:
-                try:
-                    first_seen = int(existing.get("first_seen"))
-                except Exception:
-                    first_seen = int(datetime.utcnow().timestamp())
-            payload = {
-                "user_id": int(user_id),
-                "blocked": 1 if blocked else 0,
-                "first_seen": int(first_seen),
-                "last_seen": int(datetime.utcnow().timestamp()),
-            }
-            if _firebase_update(f"users/{int(user_id)}", payload):
-                return
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
+            now = int(datetime.utcnow().timestamp())
+            first_seen = now
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
+                try:
+                    first_seen = int(prev.get("first_seen") or now)
+                except Exception:
+                    first_seen = now
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": 1 if blocked else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, blocked, first_seen, last_seen) VALUES(?, ?, ?, ?) "
@@ -1485,16 +1466,12 @@ def _db_recent_events(limit: int = 15) -> list[sqlite3.Row]:
 
 
 def _db_get_owner_id() -> Optional[int]:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            v = _firebase_get("kv/owner_id")
+    try:
+        if _rtdb_enabled():
+            v = _rtdb_get("kv/owner_id")
             if v is None:
                 return None
-            return int(v)
-        except Exception:
-            pass
-    try:
+            return int(str(v).strip())
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='owner_id'").fetchone()
             if not row:
@@ -1506,21 +1483,29 @@ def _db_get_owner_id() -> Optional[int]:
 
 
 def _db_set_owner_id(owner_id: int) -> None:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            if _firebase_set("kv/owner_id", str(int(owner_id))):
-                return
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/owner_id", str(int(owner_id)))
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('owner_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(int(owner_id)),),
             )
     except Exception:
-        logger.exception("Failed to set owner id")
+        logger.exception("Failed to set owner id in db")
+
+
+def _db_put_message(chat_id: int, message_id: int, payload: dict) -> None:
+    try:
+        now = int(datetime.utcnow().timestamp())
+        with _db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO messages(chat_id, message_id, payload_json, created_at) VALUES(?,?,?,?)",
+                (int(chat_id), int(message_id), json.dumps(payload, ensure_ascii=False), now),
+            )
+    except Exception:
+        logger.exception("Failed to put message into db")
 
 
 def _db_get_message(chat_id: int, message_id: int) -> Optional[dict]:
@@ -1684,19 +1669,15 @@ def _db_forwarded_set(chat_id: int, message_id: int, tag: str) -> None:
 
 
 _db_init()
+_rtdb_bootstrap_from_sqlite_if_empty()
 OWNER_ID = _db_get_owner_id()
 
 
 def _db_kv_get(key: str) -> Optional[str]:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            v = _firebase_get(f"kv/{str(key)}")
-            if v is not None:
-                return str(v)
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            v = _rtdb_get(f"kv/{str(key)}")
+            return str(v) if v is not None else None
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
             return str(row["value"]) if row else None
@@ -1706,14 +1687,10 @@ def _db_kv_get(key: str) -> Optional[str]:
 
 
 def _db_kv_set(key: str, value: str) -> None:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            if _firebase_set(f"kv/{str(key)}", str(value)):
-                return
-        except Exception:
-            pass
     try:
+        if _rtdb_enabled():
+            _rtdb_put(f"kv/{str(key)}", str(value))
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1735,281 +1712,28 @@ def _stars_price(plan: str) -> int:
     return int(DEFAULT_STARS_PRICES.get(plan, 0))
 
 
-def _db_ref_invited_by(invited_user_id: int) -> Optional[int]:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get(f"referrals/{invited_user_id}")
-            if data and "inviter_user_id" in data:
-                return int(data["inviter_user_id"])
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT inviter_user_id FROM referrals WHERE invited_user_id=?",
-                (int(invited_user_id),),
-            ).fetchone()
-            return int(row["inviter_user_id"]) if row else None
-    except Exception:
-        logger.exception("Failed to check referral")
-        return None
-
-
-def _db_ref_count(inviter_user_id: int) -> int:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get("referrals")
-            if data and isinstance(data, dict):
-                count = sum(1 for info in data.values() if info.get("inviter_user_id") == int(inviter_user_id))
-                return count
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT COUNT(1) AS cnt FROM referrals WHERE inviter_user_id=?",
-                (int(inviter_user_id),),
-            ).fetchone()
-            return int(row["cnt"]) if row else 0
-    except Exception:
-        logger.exception("Failed to count referrals")
-        return 0
-
-
-def _db_ref_coupon_available(user_id: int, kind: str) -> bool:
-    # Try Firebase first
-    if firebase_db:
-        try:
-            data = _firebase_get(f"referral_coupons/{user_id}/{kind}")
-            if data and data.get("used_at") is None:
-                return True
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT used_at FROM referral_coupons WHERE user_id=? AND kind=?",
-                (int(user_id), str(kind)),
-            ).fetchone()
-            return bool(row) and row["used_at"] is None
-    except Exception:
-        logger.exception("Failed to check referral coupon")
-        return False
-
-
-def _db_ref_coupon_ensure(user_id: int, kind: str) -> None:
-    now = int(datetime.utcnow().timestamp())
-    # Try Firebase first
-    if firebase_db:
-        data = {
-            "created_at": now,
-            "used_at": None
-        }
-        if _firebase_set(f"referral_coupons/{user_id}/{kind}", data):
-            return
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO referral_coupons(user_id, kind, created_at, used_at) VALUES(?, ?, ?, NULL)",
-                (int(user_id), str(kind), now),
-            )
-    except Exception:
-        logger.exception("Failed to create referral coupon")
-
-
-def _db_ref_coupon_mark_used(user_id: int, kind: str) -> None:
-    now = int(datetime.utcnow().timestamp())
-    # Try Firebase first
-    if firebase_db:
-        if _firebase_update(f"referral_coupons/{user_id}/{kind}", {"used_at": now}):
-            return
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            conn.execute(
-                "UPDATE referral_coupons SET used_at=? WHERE user_id=? AND kind=? AND used_at IS NULL",
-                (now, int(user_id), str(kind)),
-            )
-    except Exception:
-        logger.exception("Failed to mark referral coupon used")
-
-
-def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, int, bool]:
-    """Register referral. Returns (inserted, new_count_for_inviter, awarded_coupon_now)."""
-    now = int(datetime.utcnow().timestamp())
-    inserted = False
-    awarded = False
-    
-    # Try Firebase first
-    if firebase_db:
-        try:
-            # Check if already exists
-            existing = _firebase_get(f"referrals/{invited_user_id}")
-            if existing:
-                cnt = _db_ref_count(int(inviter_user_id))
-                return False, cnt, False
-            
-            # Create referral
-            data = {
-                "inviter_user_id": int(inviter_user_id),
-                "created_at": now
-            }
-            if _firebase_set(f"referrals/{invited_user_id}", data):
-                inserted = True
-                cnt = _db_ref_count(int(inviter_user_id))
-                
-                # Award coupon once when reaching 2 invites
-                if cnt >= 2:
-                    coupon_data = _firebase_get(f"referral_coupons/{inviter_user_id}/{REF_COUPON_KIND_14D_50}")
-                    if not coupon_data:
-                        coupon = {
-                            "created_at": now,
-                            "used_at": None
-                        }
-                        if _firebase_set(f"referral_coupons/{inviter_user_id}/{REF_COUPON_KIND_14D_50}", coupon):
-                            awarded = True
-                
-                return inserted, cnt, awarded
-        except Exception:
-            pass
-    
-    # Fallback to SQLite
-    try:
-        with _db() as conn:
-            # Only first /start for invited user counts.
-            if conn.execute(
-                "SELECT 1 FROM referrals WHERE invited_user_id=?",
-                (int(invited_user_id),),
-            ).fetchone():
-                cnt = conn.execute(
-                    "SELECT COUNT(1) AS cnt FROM referrals WHERE inviter_user_id=?",
-                    (int(inviter_user_id),),
-                ).fetchone()
-                return False, int(cnt["cnt"]) if cnt else 0, False
-
-            conn.execute(
-                "INSERT INTO referrals(invited_user_id, inviter_user_id, created_at) VALUES(?, ?, ?)",
-                (int(invited_user_id), int(inviter_user_id), now),
-            )
-            inserted = True
-
-            cnt_row = conn.execute(
-                "SELECT COUNT(1) AS cnt FROM referrals WHERE inviter_user_id=?",
-                (int(inviter_user_id),),
-            ).fetchone()
-            cnt = int(cnt_row["cnt"]) if cnt_row else 0
-
-            # Award coupon once when reaching 2 invites.
-            if cnt >= 2:
-                row = conn.execute(
-                    "SELECT used_at FROM referral_coupons WHERE user_id=? AND kind=?",
-                    (int(inviter_user_id), REF_COUPON_KIND_14D_50),
-                ).fetchone()
-                if not row:
-                    conn.execute(
-                        "INSERT INTO referral_coupons(user_id, kind, created_at, used_at) VALUES(?, ?, ?, NULL)",
-                        (int(inviter_user_id), REF_COUPON_KIND_14D_50, now),
-                    )
-                    awarded = True
-            return inserted, cnt, awarded
-    except Exception:
-        logger.exception("Failed to register referral")
-        return False, _db_ref_count(int(inviter_user_id)), False
-
-
-def _ref_discounted_price_14d() -> int:
-    base = int(_stars_price("14d"))
-    # Stars amount must be an integer. Round up to avoid 0 and keep consistent.
-    return max(1, (base + 1) // 2)
-
-
-def _parse_start_payload(text: str) -> Optional[str]:
-    """Extract /start payload (deep-link argument) from message text."""
-    t = (text or "").strip()
-    if not t.startswith("/start"):
-        return None
-    parts = t.split(maxsplit=1)
-    if len(parts) < 2:
-        return None
-    return parts[1].strip() or None
-
-
-def _parse_ref_payload(payload: Optional[str]) -> Optional[int]:
-    if not payload:
-        return None
-    p = str(payload).strip()
-    if not p.startswith("ref_"):
-        return None
-    try:
-        return int(p.split("_", 1)[1])
-    except Exception:
-        return None
-
-
 def _stars_plan(plan: str) -> Optional[tuple[int, int]]:
     if plan not in STARS_DURATIONS:
         return None
     price = _stars_price(plan)
     if price <= 0:
         return None
-    return (int(price), int(STARS_DURATIONS[plan]))
-
-
-def _stars_buttons_for_user(user_id: int) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for plan, label in [("7d", "7 дней"), ("14d", "14 дней"), ("30d", "30 дней")]:
-        p = _stars_plan(plan)
-        if not p:
-            continue
-        price, _ = p
-        text = f"{label} — {price}⭐"
-        if plan == "14d" and _db_ref_coupon_available(int(user_id), REF_COUPON_KIND_14D_50):
-            text = f"{label} — {_ref_discounted_price_14d()}⭐ (скидка 50%)"
-        rows.append([InlineKeyboardButton(text=text, callback_data=f"buy:{plan}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def _handle_start_referral(*, user_id: int, text: str) -> None:
-    """Register referral from /start payload and notify inviter when coupon is awarded."""
-    payload = _parse_start_payload(text)
-    inviter_id = _parse_ref_payload(payload)
-    if not inviter_id:
-        return
-    if int(inviter_id) == int(user_id):
-        return
-    inserted, cnt, awarded = _db_ref_register(int(inviter_id), int(user_id))
-    if not inserted:
-        return
-    if _db_is_bot_user(int(inviter_id)):
-        try:
-            msg = f"👥 Новый реферал: {int(user_id)}\nПриглашено: {cnt}/2"
-            if awarded:
-                msg += "\n\n🎉 Награда: скидка 50% на 14 дней доступна в разделе '👥 Рефералы'"
-            await bot.send_message(int(inviter_id), msg)
-        except Exception:
-            logger.exception("Failed to notify inviter")
+    return (price, int(STARS_DURATIONS[plan]))
 
 
 def _stars_buttons() -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    for plan, label in [("7d", "7 дней"), ("14d", "14 дней"), ("30d", "30 дней")]:
-        p = _stars_plan(plan)
-        if not p:
-            continue
-        price, _ = p
-        rows.append([InlineKeyboardButton(text=f"{label} — {price}⭐", callback_data=f"buy:{plan}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    p7 = _stars_price("7d")
+    p14 = _stars_price("14d")
+    p30 = _stars_price("30d")
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"7 дней — {p7}⭐", callback_data="buy:7d"),
+                InlineKeyboardButton(text=f"14 дней — {p14}⭐", callback_data="buy:14d"),
+            ],
+            [InlineKeyboardButton(text=f"30 дней — {p30}⭐", callback_data="buy:30d")],
+        ]
+    )
 
 
 def _user_link(u: dict) -> str:
@@ -2515,11 +2239,6 @@ async def _process_update(update: dict) -> None:
             if uid is not None and payload.startswith("sub:"):
                 parts = payload.split(":")
                 plan = parts[1] if len(parts) > 1 else ""
-                # Example payloads:
-                #   sub:14d:<user_id>
-                #   sub:14d:<user_id>:ref50
-                if plan == "14d" and len(parts) > 3 and parts[3] == "ref50":
-                    _db_ref_coupon_mark_used(int(uid), REF_COUPON_KIND_14D_50)
                 p = _stars_plan(plan)
                 if p:
                     _, seconds = p
@@ -2623,9 +2342,6 @@ async def _process_update(update: dict) -> None:
                 return
             stars, _ = p
             payload = f"sub:{plan}:{int(from_id)}"
-            if plan == "14d" and _db_ref_coupon_available(int(from_id), REF_COUPON_KIND_14D_50):
-                stars = _ref_discounted_price_14d()
-                payload = f"sub:{plan}:{int(from_id)}:ref50"
             title = "Доступ к бизнес-уведомлениям"
             descr = {
                 "7d": "Доступ на 7 дней",
@@ -3029,14 +2745,13 @@ async def _process_update(update: dict) -> None:
                 if int(chat_id) != int(ADMIN_ID) and not _db_is_whitelisted(int(chat_id)):
                     pending_kind = _db_access_get_pending(int(chat_id))
                     txt_raw = (m.get("text") or "").strip()
-                    if txt_raw.startswith("/start"):
-                        await _handle_start_referral(user_id=int(chat_id), text=txt_raw)
+                    if txt_raw == "/start":
                         _db_access_set_pending(int(chat_id), True, "user")
                         await bot.send_message(int(chat_id), "🔐 Введите код доступа")
                         return
 
                     if txt == "⭐ Купить доступ":
-                        kb = _stars_buttons_for_user(int(chat_id))
+                        kb = _stars_buttons()
                         await _send_premium_header(int(chat_id), "Оплата Telegram Stars")
                         await bot.send_message(
                             int(chat_id),
@@ -3071,7 +2786,6 @@ async def _process_update(update: dict) -> None:
                     "🆘 Техподдержка",
                     "🔗 Подключить бизнес",
                     "⭐ Купить доступ",
-                    "👥 Рефералы",
                     "👑 Админка",
                     "🚫 Черный список",
                     "📣 Рассылка",
@@ -3084,9 +2798,6 @@ async def _process_update(update: dict) -> None:
                     if txt == "📊 Статус":
                         await _send_status(int(chat_id))
                         return
-                    if txt == "👥 Рефералы":
-                        await _send_referrals(int(chat_id))
-                        return
                     if txt == "🔒 Конфиденциальность":
                         await _send_privacy(int(chat_id))
                         return
@@ -3097,7 +2808,7 @@ async def _process_update(update: dict) -> None:
 
                     if txt == "🔗 Подключить бизнес":
                         if not _has_active_subscription(int(chat_id)):
-                            kb = _stars_buttons_for_user(int(chat_id))
+                            kb = _stars_buttons()
                             await bot.send_message(
                                 int(chat_id),
                                 "⭐ Для подключения бизнеса нужен активный доступ. Выберите тариф:",
@@ -3133,11 +2844,11 @@ async def _process_update(update: dict) -> None:
                         return
                     if txt == "👑 Админка" and int(chat_id) == int(ADMIN_ID):
                         # emulate admin callback
-                        update2 = {"callback_query": {"data": "admin", "from": sender}}
+                        update2 = {"callback_query": {"id": "0", "data": "admin", "from": sender}}
                         await _process_update(update2)
                         return
                     if txt == "🚫 Черный список" and int(chat_id) == int(ADMIN_ID):
-                        update2 = {"callback_query": {"data": "admin_blacklist", "from": sender}}
+                        update2 = {"callback_query": {"id": "0", "data": "admin_blacklist", "from": sender}}
                         await _process_update(update2)
                         return
 
@@ -3310,10 +3021,9 @@ async def _process_update(update: dict) -> None:
         _enforce_media_limit()
 
         # /start handling
-        if key == "message" and isinstance(m.get("text"), str) and m.get("text").startswith("/start"):
+        if key == "message" and m.get("text") == "/start":
             if sender and isinstance(sender, dict) and sender.get("id"):
                 _db_log_event(user_id=int(sender.get("id")), action="start")
-                await _handle_start_referral(user_id=int(sender.get("id")), text=str(m.get("text") or ""))
             # Only the main admin can register/set the OWNER_ID.
             await _send_start(int(chat_id), set_owner=(int(chat_id) == int(ADMIN_ID)))
 
@@ -3572,48 +3282,10 @@ async def main() -> None:
         await bot.session.close()
 
 
-def _firebase_init_structure() -> None:
-    """Initialize Firebase database structure if not exists."""
-    if not firebase_db:
-        return
-    
-    try:
-        # Initialize default values
-        default_data = {
-            "kv": {
-                "paid_mode": "0",
-                "stars_price_7d": "15",
-                "stars_price_14d": "25",
-                "stars_price_30d": "45"
-            },
-            "users": {},
-            "subscriptions": {},
-            "free_users": {},
-            "referrals": {},
-            "referral_coupons": {}
-        }
-        
-        # Only set if paths don't exist
-        for path, data in default_data.items():
-            existing = _firebase_get(path)
-            if existing is None:
-                _firebase_set(path, data)
-                logger.info(f"Initialized Firebase path: {path}")
-        
-        logger.info("Firebase structure initialized")
-    except Exception as e:
-        logger.warning(f"Failed to initialize Firebase structure: {e}")
-
-
 if __name__ == "__main__":
-    # Initialize Firebase structure if Firebase is available
-    _firebase_init_structure()
-    
     # Optional keep-alive HTTP endpoint (useful for Replit).
     # Enable with: KEEPALIVE_HTTP=1
-    # On Render Web Service, PORT is provided. If we don't bind a port, Render may stop the service.
-    # So we auto-enable keepalive when PORT is set.
-    if os.getenv("KEEPALIVE_HTTP") == "1" or os.getenv("PORT"):
+    if os.getenv("KEEPALIVE_HTTP") == "1":
         from flask import Flask
         import threading
 
@@ -3623,18 +3295,10 @@ if __name__ == "__main__":
         def home():
             return "Bot is alive"
 
-        @app.route("/healthz")
-        def healthz():
-            return "ok"
-
         def run_flask():
-            app.run(
-                host="0.0.0.0",
-                port=int(os.getenv("PORT", "5000")),
-                debug=False,
-                use_reloader=False,
-            )
+            app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
 
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
+
