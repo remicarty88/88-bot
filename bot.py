@@ -12,13 +12,8 @@ import time
 import aiohttp
 from dotenv import load_dotenv
 from aiogram.exceptions import TelegramForbiddenError
-try:
-    import firebase_admin
-    from firebase_admin import credentials, db
-except ModuleNotFoundError:
-    firebase_admin = None
-    credentials = None
-    db = None
+import firebase_admin
+from firebase_admin import credentials, db
 
 from aiogram import Bot
 from aiogram.client.default import DefaultBotProperties
@@ -40,12 +35,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set BOT_TOKEN in .env or environment variables.")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger(__name__)
-
 # Firebase configuration
 FIREBASE_DATABASE_URL = os.getenv("FIREBASE_DATABASE_URL", "https://neonapp-a05b0-default-rtdb.firebaseio.com/")
 FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
@@ -54,7 +43,7 @@ FIREBASE_KEY_PATH = os.getenv("FIREBASE_KEY_PATH", "firebase-key.json")
 firebase_creds = None
 firebase_db = None
 try:
-    if firebase_admin and credentials and db and os.path.exists(FIREBASE_KEY_PATH):
+    if os.path.exists(FIREBASE_KEY_PATH):
         cred = credentials.Certificate(FIREBASE_KEY_PATH)
         firebase_admin.initialize_app(cred, {
             'databaseURL': FIREBASE_DATABASE_URL
@@ -65,6 +54,12 @@ try:
         logger.warning(f"Firebase key file not found at {FIREBASE_KEY_PATH}, falling back to SQLite")
 except Exception as e:
     logger.warning(f"Failed to initialize Firebase: {e}, falling back to SQLite")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
@@ -93,6 +88,8 @@ STARS_DURATIONS: dict[str, int] = {
     "30d": 30 * 24 * 60 * 60,
 }
 DEFAULT_STARS_PRICES: dict[str, int] = {"7d": 15, "14d": 25, "30d": 45}
+
+REF_COUPON_KIND_14D_50 = "ref50_14d"
 
 # Dedup notifications (prevents double sends when Telegram delivers the same business event twice)
 _RECENT_NOTIFY: dict[tuple[Any, ...], float] = {}
@@ -223,16 +220,6 @@ def _db_init() -> None:
                 created_at INTEGER NOT NULL,
                 used_at INTEGER,
                 PRIMARY KEY(user_id, kind)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS referral_rewards (
-                user_id INTEGER PRIMARY KEY,
-                awarded_cnt INTEGER NOT NULL DEFAULT 0,
-                updated_at INTEGER NOT NULL
             )
             """
         )
@@ -1153,7 +1140,6 @@ def _main_menu_kb(*, is_admin: bool) -> ReplyKeyboardMarkup:
     ]
     if is_admin:
         rows.append([KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")])
-        rows.append([KeyboardButton(text="👥 Пользователи")])
         rows.append([KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="❌ Отмена")])
         rows.append([KeyboardButton(text="🔑 Код доступа")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
@@ -1163,80 +1149,15 @@ async def _send_referrals(chat_id: int) -> None:
     bot_username = await _get_bot_username()
     cnt = _db_ref_count(int(chat_id))
     link = f"https://t.me/{bot_username}?start=ref_{int(chat_id)}"
-    awarded_cnt = _db_ref_awarded_cnt(int(chat_id))
-    total_awards = int(cnt) // 3
-    next_need = 3 - (int(cnt) % 3) if (int(cnt) % 3) != 0 else 3
-    pending = max(0, total_awards - int(awarded_cnt))
+    has_coupon = _db_ref_coupon_available(int(chat_id), REF_COUPON_KIND_14D_50)
     txt = (
         "👥 Рефералы\n\n"
         f"Твоя ссылка:\n{link}\n\n"
-        f"Приглашено: {int(cnt)}\n"
-        "Награда: за каждые 3 приглашённых — +3 дня подписки.\n\n"
-        f"До следующей награды осталось: {int(next_need)}\n"
-        f"Наград начислено: {int(awarded_cnt)} из {int(total_awards)}"
-        + (f"\n\n⚠️ Есть неначисленные награды: {int(pending)}" if pending > 0 else "")
+        f"Приглашено: {cnt} (нужно 2)\n"
+        "Награда: 50% скидка на тариф 14 дней (1 раз).\n\n"
+        f"Статус скидки: {'✅ доступна' if has_coupon else '❌ нет'}"
     )
     await bot.send_message(int(chat_id), txt)
-
-
-def _db_ref_awarded_cnt(user_id: int) -> int:
-    now = int(datetime.utcnow().timestamp())
-    if firebase_db:
-        try:
-            v = _firebase_get(f"referral_rewards/{int(user_id)}/awarded_cnt")
-            if v is not None:
-                return int(v)
-        except Exception:
-            pass
-    try:
-        with _db() as conn:
-            row = conn.execute(
-                "SELECT awarded_cnt FROM referral_rewards WHERE user_id=?",
-                (int(user_id),),
-            ).fetchone()
-            return int(row["awarded_cnt"]) if row else 0
-    except Exception:
-        logger.exception("Failed to get referral awarded count")
-        return 0
-
-
-def _db_ref_set_awarded_cnt(user_id: int, awarded_cnt: int) -> None:
-    now = int(datetime.utcnow().timestamp())
-    if firebase_db:
-        try:
-            if _firebase_update(
-                f"referral_rewards/{int(user_id)}",
-                {"awarded_cnt": int(awarded_cnt), "updated_at": int(now)},
-            ):
-                return
-        except Exception:
-            pass
-    try:
-        with _db() as conn:
-            conn.execute(
-                "INSERT INTO referral_rewards(user_id, awarded_cnt, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET awarded_cnt=excluded.awarded_cnt, updated_at=excluded.updated_at",
-                (int(user_id), int(awarded_cnt), int(now)),
-            )
-    except Exception:
-        logger.exception("Failed to set referral awarded count")
-
-
-def _db_ref_award_if_needed(inviter_user_id: int, cnt: int) -> int:
-    """Award subscription days for referrals. Returns awarded_days_now."""
-    try:
-        total_awards = int(cnt) // 3
-        already_awarded = _db_ref_awarded_cnt(int(inviter_user_id))
-        delta = int(total_awards) - int(already_awarded)
-        if delta <= 0:
-            return 0
-        seconds = int(delta) * 3 * 24 * 60 * 60
-        _db_sub_extend(int(inviter_user_id), int(seconds))
-        _db_ref_set_awarded_cnt(int(inviter_user_id), int(total_awards))
-        return int(delta) * 3
-    except Exception:
-        logger.exception("Failed to award referral subscription")
-        return 0
 
 
 def _db_list_bot_user_ids() -> list[int]:
@@ -1778,11 +1699,11 @@ def _db_ref_coupon_mark_used(user_id: int, kind: str) -> None:
         logger.exception("Failed to mark referral coupon used")
 
 
-def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, int, int]:
-    """Register referral. Returns (inserted, new_count_for_inviter, awarded_days_now)."""
+def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, int, bool]:
+    """Register referral. Returns (inserted, new_count_for_inviter, awarded_coupon_now)."""
     now = int(datetime.utcnow().timestamp())
     inserted = False
-    awarded_days = 0
+    awarded = False
     
     # Try Firebase first
     if firebase_db:
@@ -1791,7 +1712,7 @@ def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, 
             existing = _firebase_get(f"referrals/{invited_user_id}")
             if existing:
                 cnt = _db_ref_count(int(inviter_user_id))
-                return False, cnt, 0
+                return False, cnt, False
             
             # Create referral
             data = {
@@ -1802,8 +1723,18 @@ def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, 
                 inserted = True
                 cnt = _db_ref_count(int(inviter_user_id))
                 
-                awarded_days = _db_ref_award_if_needed(int(inviter_user_id), int(cnt))
-                return inserted, cnt, int(awarded_days)
+                # Award coupon once when reaching 2 invites
+                if cnt >= 2:
+                    coupon_data = _firebase_get(f"referral_coupons/{inviter_user_id}/{REF_COUPON_KIND_14D_50}")
+                    if not coupon_data:
+                        coupon = {
+                            "created_at": now,
+                            "used_at": None
+                        }
+                        if _firebase_set(f"referral_coupons/{inviter_user_id}/{REF_COUPON_KIND_14D_50}", coupon):
+                            awarded = True
+                
+                return inserted, cnt, awarded
         except Exception:
             pass
     
@@ -1833,11 +1764,22 @@ def _db_ref_register(inviter_user_id: int, invited_user_id: int) -> tuple[bool, 
             ).fetchone()
             cnt = int(cnt_row["cnt"]) if cnt_row else 0
 
-            awarded_days = _db_ref_award_if_needed(int(inviter_user_id), int(cnt))
-            return inserted, cnt, int(awarded_days)
+            # Award coupon once when reaching 2 invites.
+            if cnt >= 2:
+                row = conn.execute(
+                    "SELECT used_at FROM referral_coupons WHERE user_id=? AND kind=?",
+                    (int(inviter_user_id), REF_COUPON_KIND_14D_50),
+                ).fetchone()
+                if not row:
+                    conn.execute(
+                        "INSERT INTO referral_coupons(user_id, kind, created_at, used_at) VALUES(?, ?, ?, NULL)",
+                        (int(inviter_user_id), REF_COUPON_KIND_14D_50, now),
+                    )
+                    awarded = True
+            return inserted, cnt, awarded
     except Exception:
         logger.exception("Failed to register referral")
-        return False, _db_ref_count(int(inviter_user_id)), 0
+        return False, _db_ref_count(int(inviter_user_id)), False
 
 
 def _ref_discounted_price_14d() -> int:
@@ -1886,71 +1828,31 @@ def _stars_buttons_for_user(user_id: int) -> InlineKeyboardMarkup:
             continue
         price, _ = p
         text = f"{label} — {price}⭐"
+        if plan == "14d" and _db_ref_coupon_available(int(user_id), REF_COUPON_KIND_14D_50):
+            text = f"{label} — {_ref_discounted_price_14d()}⭐ (скидка 50%)"
         rows.append([InlineKeyboardButton(text=text, callback_data=f"buy:{plan}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _handle_start_referral(*, user_id: int, text: str) -> None:
-    """Register referral from /start payload and notify inviter when reward is awarded."""
+    """Register referral from /start payload and notify inviter when coupon is awarded."""
     payload = _parse_start_payload(text)
     inviter_id = _parse_ref_payload(payload)
     if not inviter_id:
         return
     if int(inviter_id) == int(user_id):
         return
-    inserted, cnt, awarded_days = _db_ref_register(int(inviter_id), int(user_id))
+    inserted, cnt, awarded = _db_ref_register(int(inviter_id), int(user_id))
     if not inserted:
         return
     if _db_is_bot_user(int(inviter_id)):
         try:
-            msg = f"👥 Новый реферал: {int(user_id)}\nПриглашено: {int(cnt)}"
-            if int(awarded_days) > 0:
-                msg += f"\n\n🎉 Награда: +{int(awarded_days)} дня(дней) подписки начислено!"
+            msg = f"👥 Новый реферал: {int(user_id)}\nПриглашено: {cnt}/2"
+            if awarded:
+                msg += "\n\n🎉 Награда: скидка 50% на 14 дней доступна в разделе '👥 Рефералы'"
             await bot.send_message(int(inviter_id), msg)
         except Exception:
             logger.exception("Failed to notify inviter")
-
-
-async def _admin_send_users(chat_id: int) -> None:
-    if int(chat_id) != int(ADMIN_ID):
-        return
-    users = _db_list_users(limit=50, offset=0)
-    lines = ["👥 Пользователи", ""]
-    if not users:
-        lines.append("- пока нет пользователей")
-        await bot.send_message(int(chat_id), "\n".join(lines))
-        return
-
-    checked = 0
-    for u in users:
-        uid = int(u["user_id"])
-        uname = u["username"]
-        name = u["name"]
-        who = (f"@{uname}" if uname else (name or f"Пользователь {uid}")).strip()
-        blocked = bool(u["blocked"])
-
-        status = "✅"
-        if blocked:
-            status = "🚫"
-        else:
-            try:
-                await bot.send_chat_action(int(uid), "typing")
-                checked += 1
-            except TelegramForbiddenError:
-                _db_set_blocked(int(uid), True)
-                status = "🚫"
-            except Exception:
-                pass
-
-        lines.append(f"- {uid} — {who} — {status}")
-        if len("\n".join(lines)) > 3500:
-            lines.append("...")
-            break
-        if checked >= 10:
-            # do not spam Telegram API
-            break
-
-    await bot.send_message(int(chat_id), "\n".join(lines))
 
 
 def _stars_buttons() -> InlineKeyboardMarkup:
@@ -2467,6 +2369,11 @@ async def _process_update(update: dict) -> None:
             if uid is not None and payload.startswith("sub:"):
                 parts = payload.split(":")
                 plan = parts[1] if len(parts) > 1 else ""
+                # Example payloads:
+                #   sub:14d:<user_id>
+                #   sub:14d:<user_id>:ref50
+                if plan == "14d" and len(parts) > 3 and parts[3] == "ref50":
+                    _db_ref_coupon_mark_used(int(uid), REF_COUPON_KIND_14D_50)
                 p = _stars_plan(plan)
                 if p:
                     _, seconds = p
@@ -2570,6 +2477,9 @@ async def _process_update(update: dict) -> None:
                 return
             stars, _ = p
             payload = f"sub:{plan}:{int(from_id)}"
+            if plan == "14d" and _db_ref_coupon_available(int(from_id), REF_COUPON_KIND_14D_50):
+                stars = _ref_discounted_price_14d()
+                payload = f"sub:{plan}:{int(from_id)}:ref50"
             title = "Доступ к бизнес-уведомлениям"
             descr = {
                 "7d": "Доступ на 7 дней",
@@ -3016,7 +2926,6 @@ async def _process_update(update: dict) -> None:
                     "🔗 Подключить бизнес",
                     "⭐ Купить доступ",
                     "👥 Рефералы",
-                    "👥 Пользователи",
                     "👑 Админка",
                     "🚫 Черный список",
                     "📣 Рассылка",
@@ -3031,9 +2940,6 @@ async def _process_update(update: dict) -> None:
                         return
                     if txt == "👥 Рефералы":
                         await _send_referrals(int(chat_id))
-                        return
-                    if txt == "👥 Пользователи" and int(chat_id) == int(ADMIN_ID):
-                        await _admin_send_users(int(chat_id))
                         return
                     if txt == "🔒 Конфиденциальность":
                         await _send_privacy(int(chat_id))
@@ -3538,8 +3444,7 @@ def _firebase_init_structure() -> None:
             "subscriptions": {},
             "free_users": {},
             "referrals": {},
-            "referral_coupons": {},
-            "referral_rewards": {}
+            "referral_coupons": {}
         }
         
         # Only set if paths don't exist
@@ -3587,3 +3492,4 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
+
