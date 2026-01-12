@@ -1,0 +1,11 @@
+# SQLite
+*.db-wal
+*.db-shm
+
+# Env
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
