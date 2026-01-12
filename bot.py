@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import sqlite3
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
@@ -47,12 +49,6 @@ MAX_MEDIA_FILES = 300
 
 DB_PATH = Path(os.getenv("DB_PATH", "bot.db"))
 
-# Ensure DB directory exists (important for persistent disks like /var/data on Render)
-try:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
 OWNER_ID: Optional[int] = None
 
 ADMIN_ID = 6201234513
@@ -66,6 +62,9 @@ STARS_DURATIONS: dict[str, int] = {
     "30d": 30 * 24 * 60 * 60,
 }
 DEFAULT_STARS_PRICES: dict[str, int] = {"7d": 15, "14d": 25, "30d": 45}
+
+FIREBASE_DB_URL = (os.getenv("FIREBASE_DB_URL") or "").strip().rstrip("/")
+FIREBASE_DB_TOKEN = (os.getenv("FIREBASE_DB_TOKEN") or "").strip()
 
 # Dedup notifications (prevents double sends when Telegram delivers the same business event twice)
 _RECENT_NOTIFY: dict[tuple[Any, ...], float] = {}
@@ -81,6 +80,7 @@ def _conv_pair(a: Optional[int], b: Optional[int]) -> Optional[tuple[int, int]]:
     except Exception:
         return None
     return (a_i, b_i) if a_i <= b_i else (b_i, a_i)
+
 
 SUPPORT_CHAT_ID = -5226762204
 
@@ -105,6 +105,126 @@ def _db() -> sqlite3.Connection:
         # Best-effort pragmas
         pass
     return conn
+
+
+def _rtdb_enabled() -> bool:
+    return bool(FIREBASE_DB_URL)
+
+
+def _rtdb_url(path: str) -> str:
+    p = str(path).strip().lstrip("/")
+    url = f"{FIREBASE_DB_URL}/{p}.json"
+    if FIREBASE_DB_TOKEN:
+        url += "?" + urllib.parse.urlencode({"auth": FIREBASE_DB_TOKEN})
+    return url
+
+
+def _rtdb_request(method: str, path: str, data: Optional[Any] = None) -> Any:
+    url = _rtdb_url(path)
+    body: Optional[bytes] = None
+    if data is not None:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method=str(method).upper(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read()
+    if not raw:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def _rtdb_get(path: str) -> Any:
+    try:
+        return _rtdb_request("GET", path)
+    except Exception:
+        logger.exception("RTDB GET failed: %s", path)
+        return None
+
+
+def _rtdb_put(path: str, data: Any) -> bool:
+    try:
+        _rtdb_request("PUT", path, data)
+        return True
+    except Exception:
+        logger.exception("RTDB PUT failed: %s", path)
+        return False
+
+
+def _rtdb_delete(path: str) -> bool:
+    try:
+        _rtdb_request("DELETE", path, None)
+        return True
+    except Exception:
+        logger.exception("RTDB DELETE failed: %s", path)
+        return False
+
+
+def _rtdb_bootstrap_from_sqlite_if_empty() -> None:
+    if not _rtdb_enabled():
+        return
+    try:
+        existing_kv = _rtdb_get("kv")
+        if isinstance(existing_kv, dict) and existing_kv:
+            return
+    except Exception:
+        return
+
+    try:
+        with _db() as conn:
+            kv_rows = conn.execute("SELECT key, value FROM kv").fetchall()
+            for r in kv_rows:
+                _rtdb_put(f"kv/{str(r['key'])}", str(r["value"]))
+
+            user_rows = conn.execute(
+                "SELECT user_id, username, name, first_seen, last_seen, blocked, bot_user, whitelisted FROM users"
+            ).fetchall()
+            for r in user_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"users/{uid}",
+                    {
+                        "user_id": int(r["user_id"]),
+                        "username": r["username"],
+                        "name": r["name"],
+                        "first_seen": int(r["first_seen"]),
+                        "last_seen": int(r["last_seen"]),
+                        "blocked": int(r["blocked"]),
+                        "bot_user": int(r["bot_user"]),
+                        "whitelisted": int(r["whitelisted"]),
+                    },
+                )
+
+            sub_rows = conn.execute(
+                "SELECT user_id, paid_until, created_at, updated_at FROM subscriptions"
+            ).fetchall()
+            for r in sub_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"subscriptions/{uid}",
+                    {
+                        "user_id": int(r["user_id"]),
+                        "paid_until": int(r["paid_until"]),
+                        "created_at": int(r["created_at"]),
+                        "updated_at": int(r["updated_at"]),
+                    },
+                )
+
+            free_rows = conn.execute("SELECT user_id, created_at FROM free_users").fetchall()
+            for r in free_rows:
+                uid = str(int(r["user_id"]))
+                _rtdb_put(
+                    f"free_users/{uid}",
+                    {"user_id": int(r["user_id"]), "created_at": int(r["created_at"])},
+                )
+
+        _rtdb_put("meta/bootstrapped_at", int(datetime.utcnow().timestamp()))
+        logger.info("RTDB bootstrapped from SQLite")
+    except Exception:
+        logger.exception("Failed to bootstrap RTDB from SQLite")
 
 
 async def _get_bot_username() -> str:
@@ -324,6 +444,9 @@ def _db_init() -> None:
 
 def _db_get_paid_mode() -> bool:
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get("kv/paid_mode")
+            return bool(int(row or 0))
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='paid_mode'").fetchone()
             if not row:
@@ -336,6 +459,9 @@ def _db_get_paid_mode() -> bool:
 
 def _db_set_paid_mode(enabled: bool) -> None:
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/paid_mode", "1" if enabled else "0")
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('paid_mode', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -347,6 +473,9 @@ def _db_set_paid_mode(enabled: bool) -> None:
 
 def _db_is_free_user(user_id: int) -> bool:
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"free_users/{int(user_id)}")
+            return bool(row)
         with _db() as conn:
             row = conn.execute("SELECT 1 FROM free_users WHERE user_id=?", (int(user_id),)).fetchone()
             return row is not None
@@ -357,6 +486,15 @@ def _db_is_free_user(user_id: int) -> bool:
 
 def _db_set_free_user(user_id: int, enabled: bool) -> None:
     try:
+        if _rtdb_enabled():
+            if enabled:
+                _rtdb_put(
+                    f"free_users/{int(user_id)}",
+                    {"user_id": int(user_id), "created_at": int(datetime.utcnow().timestamp())},
+                )
+            else:
+                _rtdb_delete(f"free_users/{int(user_id)}")
+            return
         with _db() as conn:
             if enabled:
                 conn.execute(
@@ -371,6 +509,11 @@ def _db_set_free_user(user_id: int, enabled: bool) -> None:
 
 def _db_list_free_users(limit: int = 50) -> list[int]:
     try:
+        if _rtdb_enabled():
+            rows = _rtdb_get("free_users")
+            if not rows:
+                return []
+            return [int(r["user_id"]) for r in rows.values()]
         with _db() as conn:
             rows = conn.execute(
                 "SELECT user_id FROM free_users ORDER BY created_at DESC LIMIT ?",
@@ -384,6 +527,9 @@ def _db_list_free_users(limit: int = 50) -> list[int]:
 
 def _db_sub_get_paid_until(user_id: int) -> int:
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"subscriptions/{int(user_id)}")
+            return int(row.get("paid_until") or 0)
         with _db() as conn:
             row = conn.execute("SELECT paid_until FROM subscriptions WHERE user_id=?", (int(user_id),)).fetchone()
             return int(row["paid_until"]) if row else 0
@@ -398,6 +544,17 @@ def _db_sub_extend(user_id: int, seconds: int) -> int:
     base = cur if cur > now else now
     new_until = int(base + int(seconds))
     try:
+        if _rtdb_enabled():
+            _rtdb_put(
+                f"subscriptions/{int(user_id)}",
+                {
+                    "user_id": int(user_id),
+                    "paid_until": int(new_until),
+                    "created_at": int(now),
+                    "updated_at": int(now),
+                },
+            )
+            return new_until
         with _db() as conn:
             conn.execute(
                 """
@@ -449,6 +606,29 @@ def _db_touch_user(u: dict) -> None:
     username = u.get("username")
     name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip() or None
     try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
+            first_seen = now
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
+                try:
+                    first_seen = int(prev.get("first_seen") or now)
+                except Exception:
+                    first_seen = now
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": username,
+                    "name": name,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 """
@@ -532,6 +712,9 @@ def _db_upsert_business_connection_safe(connection_id: str, owner_user_id: int) 
 def _db_is_bot_user(user_id: int) -> bool:
     """True if user has interacted with bot in private chat (so bot can PM them)."""
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            return bool(int(row.get("bot_user") or 0))
         with _db() as conn:
             row = conn.execute("SELECT bot_user FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["bot_user"]) if row else False
@@ -755,6 +938,29 @@ def _target_owner_for_business(obj: dict) -> Optional[int]:
 def _db_mark_bot_user(user_id: int) -> None:
     now = int(datetime.utcnow().timestamp())
     try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
+            first_seen = now
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
+                try:
+                    first_seen = int(prev.get("first_seen") or now)
+                except Exception:
+                    first_seen = now
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": 1,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, bot_user, first_seen, last_seen) VALUES(?, 1, ?, ?) "
@@ -777,6 +983,11 @@ def _db_is_whitelisted(user_id: int) -> bool:
         # fall back to DB flag
         pass
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            if isinstance(row, dict) and row.get("whitelisted") is not None:
+                return bool(int(row.get("whitelisted") or 0))
+            return False
         with _db() as conn:
             row = conn.execute("SELECT whitelisted FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["whitelisted"]) if row else False
@@ -788,6 +999,29 @@ def _db_is_whitelisted(user_id: int) -> bool:
 def _db_set_whitelisted(user_id: int, whitelisted: bool) -> None:
     now = int(datetime.utcnow().timestamp())
     try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
+            first_seen = now
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
+                try:
+                    first_seen = int(prev.get("first_seen") or now)
+                except Exception:
+                    first_seen = now
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": 1 if whitelisted else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, whitelisted, first_seen, last_seen) VALUES(?, ?, ?, ?) "
@@ -842,6 +1076,14 @@ def _db_get_access_code() -> Optional[str]:
     if cached_ts and (time.time() - cached_ts) < 60:
         return cached_value
     try:
+        if _rtdb_enabled():
+            v = _rtdb_get("kv/access_code")
+            if v is None:
+                _ACCESS_CODE_CACHE = (None, time.time())
+                return None
+            res = str(v).strip() or None
+            _ACCESS_CODE_CACHE = (res, time.time())
+            return res
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='access_code'").fetchone()
             if not row:
@@ -859,6 +1101,10 @@ def _db_get_access_code() -> Optional[str]:
 def _db_set_access_code(code: str) -> None:
     global _ACCESS_CODE_CACHE
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/access_code", str(code).strip())
+            _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('access_code', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -973,6 +1219,30 @@ def _main_menu_kb(*, is_admin: bool) -> ReplyKeyboardMarkup:
 
 def _db_list_bot_user_ids() -> list[int]:
     try:
+        if _rtdb_enabled():
+            users = _rtdb_get("users") or {}
+            if not isinstance(users, dict):
+                return []
+            out: list[int] = []
+            for k, v in users.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    uid = int(v.get("user_id") or k)
+                except Exception:
+                    continue
+                try:
+                    if int(v.get("bot_user") or 0) != 1:
+                        continue
+                    if int(v.get("blocked") or 0) != 0:
+                        continue
+                    if int(v.get("whitelisted") or 0) != 1:
+                        continue
+                except Exception:
+                    continue
+                out.append(int(uid))
+            out.sort()
+            return out
         with _db() as conn:
             rows = conn.execute(
                 "SELECT user_id FROM users WHERE bot_user=1 AND blocked=0 AND whitelisted=1"
@@ -1072,6 +1342,9 @@ def _db_stats_users_count() -> int:
 
 def _db_is_blocked(user_id: int) -> bool:
     try:
+        if _rtdb_enabled():
+            row = _rtdb_get(f"users/{int(user_id)}")
+            return bool(int((row or {}).get("blocked") or 0))
         with _db() as conn:
             row = conn.execute("SELECT blocked FROM users WHERE user_id=?", (int(user_id),)).fetchone()
             return bool(row["blocked"]) if row else False
@@ -1091,6 +1364,30 @@ def _is_blocked_effective(user_id: int) -> bool:
 
 def _db_set_blocked(user_id: int, blocked: bool) -> None:
     try:
+        if _rtdb_enabled():
+            uid = str(int(user_id))
+            prev = _rtdb_get(f"users/{uid}")
+            now = int(datetime.utcnow().timestamp())
+            first_seen = now
+            if isinstance(prev, dict) and prev.get("first_seen") is not None:
+                try:
+                    first_seen = int(prev.get("first_seen") or now)
+                except Exception:
+                    first_seen = now
+            _rtdb_put(
+                f"users/{uid}",
+                {
+                    "user_id": int(user_id),
+                    "username": prev.get("username") if isinstance(prev, dict) else None,
+                    "name": prev.get("name") if isinstance(prev, dict) else None,
+                    "first_seen": int(first_seen),
+                    "last_seen": int(now),
+                    "blocked": 1 if blocked else 0,
+                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
+                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
+                },
+            )
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO users(user_id, blocked, first_seen, last_seen) VALUES(?, ?, ?, ?) "
@@ -1170,6 +1467,11 @@ def _db_recent_events(limit: int = 15) -> list[sqlite3.Row]:
 
 def _db_get_owner_id() -> Optional[int]:
     try:
+        if _rtdb_enabled():
+            v = _rtdb_get("kv/owner_id")
+            if v is None:
+                return None
+            return int(str(v).strip())
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key='owner_id'").fetchone()
             if not row:
@@ -1182,6 +1484,9 @@ def _db_get_owner_id() -> Optional[int]:
 
 def _db_set_owner_id(owner_id: int) -> None:
     try:
+        if _rtdb_enabled():
+            _rtdb_put("kv/owner_id", str(int(owner_id)))
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES('owner_id', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1364,11 +1669,15 @@ def _db_forwarded_set(chat_id: int, message_id: int, tag: str) -> None:
 
 
 _db_init()
+_rtdb_bootstrap_from_sqlite_if_empty()
 OWNER_ID = _db_get_owner_id()
 
 
 def _db_kv_get(key: str) -> Optional[str]:
     try:
+        if _rtdb_enabled():
+            v = _rtdb_get(f"kv/{str(key)}")
+            return str(v) if v is not None else None
         with _db() as conn:
             row = conn.execute("SELECT value FROM kv WHERE key=?", (str(key),)).fetchone()
             return str(row["value"]) if row else None
@@ -1379,6 +1688,9 @@ def _db_kv_get(key: str) -> Optional[str]:
 
 def _db_kv_set(key: str, value: str) -> None:
     try:
+        if _rtdb_enabled():
+            _rtdb_put(f"kv/{str(key)}", str(value))
+            return
         with _db() as conn:
             conn.execute(
                 "INSERT INTO kv(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -2973,9 +3285,7 @@ async def main() -> None:
 if __name__ == "__main__":
     # Optional keep-alive HTTP endpoint (useful for Replit).
     # Enable with: KEEPALIVE_HTTP=1
-    # On Render Web Service, PORT is provided. If we don't bind a port, Render may stop the service.
-    # So we auto-enable keepalive when PORT is set.
-    if os.getenv("KEEPALIVE_HTTP") == "1" or os.getenv("PORT"):
+    if os.getenv("KEEPALIVE_HTTP") == "1":
         from flask import Flask
         import threading
 
@@ -2985,17 +3295,8 @@ if __name__ == "__main__":
         def home():
             return "Bot is alive"
 
-        @app.route("/healthz")
-        def healthz():
-            return "ok"
-
         def run_flask():
-            app.run(
-                host="0.0.0.0",
-                port=int(os.getenv("PORT", "5000")),
-                debug=False,
-                use_reloader=False,
-            )
+            app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
 
         threading.Thread(target=run_flask, daemon=True).start()
 
