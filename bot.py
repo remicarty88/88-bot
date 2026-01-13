@@ -1,4 +1,5 @@
 import asyncio
+from typing import Union
 import html
 import json
 import logging
@@ -63,8 +64,16 @@ STARS_DURATIONS: dict[str, int] = {
 }
 DEFAULT_STARS_PRICES: dict[str, int] = {"7d": 15, "14d": 25, "30d": 45}
 
-FIREBASE_DB_URL = (os.getenv("FIREBASE_DB_URL") or "").strip().rstrip("/")
-FIREBASE_DB_TOKEN = (os.getenv("FIREBASE_DB_TOKEN") or "").strip()
+FIREBASE_DB_URL = (
+    os.getenv("FIREBASE_DB_URL")
+    or os.getenv("FIREBASE_DATABASE_URL")
+    or ""
+).strip().rstrip("/")
+FIREBASE_DB_TOKEN = (
+    os.getenv("FIREBASE_DB_TOKEN")
+    or os.getenv("FIREBASE_DATABASE_SECRET")
+    or ""
+).strip()
 
 # Dedup notifications (prevents double sends when Telegram delivers the same business event twice)
 _RECENT_NOTIFY: dict[tuple[Any, ...], float] = {}
@@ -89,7 +98,6 @@ connected_chats: set[int] = set()
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
 _BOT_USERNAME_CACHE: Optional[str] = None
-_ACCESS_CODE_CACHE: tuple[Optional[str], float] = (None, 0.0)
 
 _DEBUG_LAST_BUSINESS_UPDATE_ID: Optional[int] = None
 
@@ -180,7 +188,7 @@ def _rtdb_bootstrap_from_sqlite_if_empty() -> None:
                 _rtdb_put(f"kv/{str(r['key'])}", str(r["value"]))
 
             user_rows = conn.execute(
-                "SELECT user_id, username, name, first_seen, last_seen, blocked, bot_user, whitelisted FROM users"
+                "SELECT user_id, username, name, first_seen, last_seen, blocked, bot_user FROM users"
             ).fetchall()
             for r in user_rows:
                 uid = str(int(r["user_id"]))
@@ -194,7 +202,6 @@ def _rtdb_bootstrap_from_sqlite_if_empty() -> None:
                         "last_seen": int(r["last_seen"]),
                         "blocked": int(r["blocked"]),
                         "bot_user": int(r["bot_user"]),
-                        "whitelisted": int(r["whitelisted"]),
                     },
                 )
 
@@ -303,7 +310,7 @@ def _db_init() -> None:
 
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS users (
+            CREATE TABLE IF NOT EXISTS users(
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 name TEXT,
@@ -311,7 +318,7 @@ def _db_init() -> None:
                 last_seen INTEGER NOT NULL,
                 blocked INTEGER NOT NULL DEFAULT 0,
                 bot_user INTEGER NOT NULL DEFAULT 0,
-                whitelisted INTEGER NOT NULL DEFAULT 0
+                dummy INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -415,13 +422,11 @@ def _db_init() -> None:
 
         # Lightweight migration for existing DBs
         try:
-            cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
             if "blocked" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
             if "bot_user" not in cols:
                 conn.execute("ALTER TABLE users ADD COLUMN bot_user INTEGER NOT NULL DEFAULT 0")
-            if "whitelisted" not in cols:
-                conn.execute("ALTER TABLE users ADD COLUMN whitelisted INTEGER NOT NULL DEFAULT 0")
         except Exception:
             logger.exception("Failed to migrate users table")
 
@@ -625,7 +630,6 @@ def _db_touch_user(u: dict) -> None:
                     "last_seen": int(now),
                     "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
                     "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
-                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
                 },
             )
             return
@@ -664,7 +668,7 @@ def _db_set_business_connection(connection_id: str, owner_user_id: int) -> None:
 
 
 def _db_upsert_business_connection_safe(connection_id: str, owner_user_id: int) -> bool:
-    """Insert mapping if missing. If present, overwrite only when previous owner is not whitelisted.
+    """Insert mapping if missing.
 
     Returns True if mapping was inserted/changed.
     """
@@ -695,8 +699,6 @@ def _db_upsert_business_connection_safe(connection_id: str, owner_user_id: int) 
 
             # Only allow remap TO a real bot user with access (prevents hijacking)
             if not _db_is_bot_user(new_owner):
-                return False
-            if not _db_is_whitelisted(new_owner):
                 return False
 
             conn.execute(
@@ -957,7 +959,6 @@ def _db_mark_bot_user(user_id: int) -> None:
                     "last_seen": int(now),
                     "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
                     "bot_user": 1,
-                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
                 },
             )
             return
@@ -969,67 +970,6 @@ def _db_mark_bot_user(user_id: int) -> None:
             )
     except Exception:
         logger.exception("Failed to mark bot user")
-
-
-def _db_is_whitelisted(user_id: int) -> bool:
-    if int(user_id) == int(ADMIN_ID):
-        return True
-    # If no access code is set, run in open multi-user mode.
-    # Anyone who started the bot can use it for their own Telegram Business chats.
-    try:
-        if not _db_get_access_code():
-            return True
-    except Exception:
-        # fall back to DB flag
-        pass
-    try:
-        if _rtdb_enabled():
-            row = _rtdb_get(f"users/{int(user_id)}")
-            if isinstance(row, dict) and row.get("whitelisted") is not None:
-                return bool(int(row.get("whitelisted") or 0))
-            return False
-        with _db() as conn:
-            row = conn.execute("SELECT whitelisted FROM users WHERE user_id=?", (int(user_id),)).fetchone()
-            return bool(row["whitelisted"]) if row else False
-    except Exception:
-        logger.exception("Failed to check whitelisted")
-        return False
-
-
-def _db_set_whitelisted(user_id: int, whitelisted: bool) -> None:
-    now = int(datetime.utcnow().timestamp())
-    try:
-        if _rtdb_enabled():
-            uid = str(int(user_id))
-            prev = _rtdb_get(f"users/{uid}")
-            first_seen = now
-            if isinstance(prev, dict) and prev.get("first_seen") is not None:
-                try:
-                    first_seen = int(prev.get("first_seen") or now)
-                except Exception:
-                    first_seen = now
-            _rtdb_put(
-                f"users/{uid}",
-                {
-                    "user_id": int(user_id),
-                    "username": prev.get("username") if isinstance(prev, dict) else None,
-                    "name": prev.get("name") if isinstance(prev, dict) else None,
-                    "first_seen": int(first_seen),
-                    "last_seen": int(now),
-                    "blocked": int(prev.get("blocked") or 0) if isinstance(prev, dict) else 0,
-                    "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
-                    "whitelisted": 1 if whitelisted else 0,
-                },
-            )
-            return
-        with _db() as conn:
-            conn.execute(
-                "INSERT INTO users(user_id, whitelisted, first_seen, last_seen) VALUES(?, ?, ?, ?) "
-                "ON CONFLICT(user_id) DO UPDATE SET whitelisted=excluded.whitelisted, last_seen=?",
-                (int(user_id), 1 if whitelisted else 0, now, now, now),
-            )
-    except Exception:
-        logger.exception("Failed to set whitelisted")
 
 
 def _db_notify_set(user_id: int, enabled: bool) -> None:
@@ -1048,7 +988,7 @@ def _db_notify_set(user_id: int, enabled: bool) -> None:
 def _db_notify_list_recipients() -> list[int]:
     """Recipients who should receive business notifications.
 
-    Only whitelisted + not blocked users are allowed.
+    Only not blocked users are allowed.
     """
     try:
         with _db() as conn:
@@ -1057,7 +997,7 @@ def _db_notify_list_recipients() -> list[int]:
                 SELECT nr.user_id
                 FROM notify_recipients nr
                 JOIN users u ON u.user_id = nr.user_id
-                WHERE nr.enabled=1 AND u.whitelisted=1 AND u.blocked=0
+                WHERE nr.enabled=1 AND u.blocked=0
                 ORDER BY nr.user_id ASC
                 """
             ).fetchall()
@@ -1068,51 +1008,6 @@ def _db_notify_list_recipients() -> list[int]:
     except Exception:
         logger.exception("Failed to list notify recipients")
         return [int(ADMIN_ID)]
-
-
-def _db_get_access_code() -> Optional[str]:
-    global _ACCESS_CODE_CACHE
-    cached_value, cached_ts = _ACCESS_CODE_CACHE
-    if cached_ts and (time.time() - cached_ts) < 60:
-        return cached_value
-    try:
-        if _rtdb_enabled():
-            v = _rtdb_get("kv/access_code")
-            if v is None:
-                _ACCESS_CODE_CACHE = (None, time.time())
-                return None
-            res = str(v).strip() or None
-            _ACCESS_CODE_CACHE = (res, time.time())
-            return res
-        with _db() as conn:
-            row = conn.execute("SELECT value FROM kv WHERE key='access_code'").fetchone()
-            if not row:
-                _ACCESS_CODE_CACHE = (None, time.time())
-                return None
-            v = str(row["value"]).strip()
-            res = v or None
-            _ACCESS_CODE_CACHE = (res, time.time())
-            return res
-    except Exception:
-        logger.exception("Failed to get access code")
-        return None
-
-
-def _db_set_access_code(code: str) -> None:
-    global _ACCESS_CODE_CACHE
-    try:
-        if _rtdb_enabled():
-            _rtdb_put("kv/access_code", str(code).strip())
-            _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
-            return
-        with _db() as conn:
-            conn.execute(
-                "INSERT INTO kv(key, value) VALUES('access_code', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (str(code).strip(),),
-            )
-        _ACCESS_CODE_CACHE = (str(code).strip(), time.time())
-    except Exception:
-        logger.exception("Failed to set access code")
 
 
 def _db_access_set_pending(user_id: int, pending: bool, kind: str) -> None:
@@ -1203,17 +1098,20 @@ async def _send_support_prompt(user_id: int) -> None:
     await bot.send_message(int(user_id), text, reply_markup=kb)
 
 
-def _main_menu_kb(*, is_admin: bool) -> ReplyKeyboardMarkup:
+def _main_menu_kb(*, is_admin: bool, has_subscription: bool) -> ReplyKeyboardMarkup:
+    if is_admin:
+        rows: list[list[KeyboardButton]] = [
+            [KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")],
+            [KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="❌ Отмена")],
+            [KeyboardButton(text="📊 Статус")],
+        ]
+        return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
     rows: list[list[KeyboardButton]] = [
-        [KeyboardButton(text="📌 Инструкция"), KeyboardButton(text="📊 Статус")],
+        [KeyboardButton(text="📊 Статус")],
         [KeyboardButton(text="🔒 Конфиденциальность"), KeyboardButton(text="🆘 Техподдержка")],
         [KeyboardButton(text="🔗 Подключить бизнес")],
-        [KeyboardButton(text="⭐ Купить доступ")],
     ]
-    if is_admin:
-        rows.append([KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")])
-        rows.append([KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="❌ Отмена")])
-        rows.append([KeyboardButton(text="🔑 Код доступа")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
 
@@ -1236,8 +1134,6 @@ def _db_list_bot_user_ids() -> list[int]:
                         continue
                     if int(v.get("blocked") or 0) != 0:
                         continue
-                    if int(v.get("whitelisted") or 0) != 1:
-                        continue
                 except Exception:
                     continue
                 out.append(int(uid))
@@ -1245,7 +1141,7 @@ def _db_list_bot_user_ids() -> list[int]:
             return out
         with _db() as conn:
             rows = conn.execute(
-                "SELECT user_id FROM users WHERE bot_user=1 AND blocked=0 AND whitelisted=1"
+                "SELECT user_id FROM users WHERE bot_user=1 AND blocked=0"
             ).fetchall()
             return [int(r["user_id"]) for r in rows]
     except Exception:
@@ -1280,10 +1176,10 @@ async def _send_status(chat_id: int) -> None:
     is_admin = int(chat_id) == int(ADMIN_ID)
     connections_count = _db_count_business_connections_for_owner(int(chat_id))
     chats_count = _db_owner_chat_count(int(chat_id))
-    wl = _db_is_whitelisted(int(chat_id))
+    wl = True
 
     lines = ["📊 Статус", "", f"• Ваш ID: {int(chat_id)}"]
-    lines.append(f"• Доступ: {'✅ открыт' if wl or is_admin else '🔐 закрыт'}")
+    lines.append(f"• Доступ: {'✅ открыт' if not _is_blocked_effective(int(chat_id)) else '🚫 заблокирован'}")
     if int(chat_id) == int(ADMIN_ID):
         lines.append("• Подписка: 👑 админ (бесплатно)")
     else:
@@ -1332,6 +1228,20 @@ def _db_log_event(*, user_id: Optional[int], action: str, chat_id: Optional[int]
 
 def _db_stats_users_count() -> int:
     try:
+        if _rtdb_enabled():
+            users = _rtdb_get("users") or {}
+            if not isinstance(users, dict):
+                return 0
+            c = 0
+            for _k, v in users.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    if int(v.get("bot_user") or 0) == 1:
+                        c += 1
+                except Exception:
+                    continue
+            return int(c)
         with _db() as conn:
             row = conn.execute("SELECT COUNT(*) AS c FROM users WHERE bot_user=1").fetchone()
             return int(row["c"]) if row else 0
@@ -1384,7 +1294,6 @@ def _db_set_blocked(user_id: int, blocked: bool) -> None:
                     "last_seen": int(now),
                     "blocked": 1 if blocked else 0,
                     "bot_user": int(prev.get("bot_user") or 0) if isinstance(prev, dict) else 0,
-                    "whitelisted": int(prev.get("whitelisted") or 0) if isinstance(prev, dict) else 0,
                 },
             )
             return
@@ -1398,8 +1307,49 @@ def _db_set_blocked(user_id: int, blocked: bool) -> None:
         logger.exception("Failed to set blocked")
 
 
-def _db_list_users(limit: int = 10, offset: int = 0) -> list[sqlite3.Row]:
+def _db_list_users(limit: int = 10, offset: int = 0) -> Union[list[dict], list[sqlite3.Row]]:
     try:
+        if _rtdb_enabled():
+            users = _rtdb_get("users") or {}
+            if not isinstance(users, dict):
+                return []
+            rows: list[dict] = []
+            for k, v in users.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    if int(v.get("bot_user") or 0) != 1:
+                        continue
+                except Exception:
+                    continue
+
+                try:
+                    uid = int(v.get("user_id") or k)
+                except Exception:
+                    continue
+
+                try:
+                    last_seen = int(v.get("last_seen") or 0)
+                except Exception:
+                    last_seen = 0
+                try:
+                    first_seen = int(v.get("first_seen") or 0)
+                except Exception:
+                    first_seen = 0
+
+                rows.append(
+                    {
+                        "user_id": int(uid),
+                        "username": v.get("username"),
+                        "name": v.get("name"),
+                        "first_seen": int(first_seen),
+                        "last_seen": int(last_seen),
+                        "blocked": int(v.get("blocked") or 0) if isinstance(v, dict) else 0,
+                    }
+                )
+
+            rows.sort(key=lambda r: int(r.get("last_seen") or 0), reverse=True)
+            return rows[int(offset) : int(offset) + int(limit)]
         with _db() as conn:
             return conn.execute(
                 """
@@ -1734,6 +1684,25 @@ def _stars_buttons() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text=f"30 дней — {p30}⭐", callback_data="buy:30d")],
         ]
     )
+
+
+async def _send_subscription(chat_id: int) -> None:
+    kb = _stars_buttons()
+    await _send_premium_header(int(chat_id), "Подписка")
+    until = _db_sub_get_paid_until(int(chat_id))
+    now = int(datetime.utcnow().timestamp())
+    if until > now:
+        status = f"✅ Активна до {_fmt_dt(until)}"
+        hint = "Вы можете продлить доступ заранее — срок добавится сверху."
+    else:
+        status = "❌ Не активна"
+        hint = "Чтобы подключить бизнес-чаты и получать уведомления — оформите подписку ниже."
+    text = (
+        "⭐ Доступ к бизнес-уведомлениям\n\n"
+        f"Статус: {status}\n\n"
+        f"{hint}"
+    )
+    await bot.send_message(int(chat_id), text, reply_markup=kb)
 
 
 def _user_link(u: dict) -> str:
@@ -2173,18 +2142,36 @@ async def _send_start(chat_id: int, *, set_owner: bool) -> None:
     bot_username = await _get_bot_username()
 
     is_admin = int(chat_id) == int(ADMIN_ID)
-    menu = _main_menu_kb(is_admin=is_admin)
+    has_sub = _has_active_subscription(int(chat_id))
+    menu = _main_menu_kb(is_admin=is_admin, has_subscription=bool(has_sub))
     await _send_premium_header(chat_id, "Добро пожаловать!")
     text = (
         "🕵️‍♂️ Этот бот помогает следить за вашими бизнес-чатами.\n\n"
         "Что он умеет:\n"
         "• Уведомляет об изменениях сообщений ✏️\n"
         "• Уведомляет об удалениях 🗑\n"
-        "• Сохраняет исчезающие фото/видео при ответе ⏳\n\n"
-        "Подключение: Telegram → Telegram для бизнеса → Чат-боты → добавить:\n"
-        f"<code>@{bot_username}</code>"
+        "• Сохраняет исчезающие фото/видео при ответе ⏳"
     )
     await bot.send_message(chat_id, text, reply_markup=menu)
+
+    if int(chat_id) != int(ADMIN_ID) and _db_get_paid_mode() and not has_sub:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⭐ Подписка / продлить", callback_data="open_sub")]]
+        )
+        await bot.send_message(
+            int(chat_id),
+            "🔒 Доступ к подключению бизнес-чатов сейчас не активен.\n"
+            "Оформите подписку в Telegram Stars — и сможете подключить Telegram для бизнеса.",
+            reply_markup=kb,
+        )
+
+    if has_sub:
+        await bot.send_message(
+            int(chat_id),
+            "🔗 Подключение Telegram для бизнеса:\n"
+            "Telegram → Telegram для бизнеса → Чат-боты → добавить:\n"
+            f"<code>@{bot_username}</code>",
+        )
     my_connections = _db_count_business_connections_for_owner(int(chat_id))
     my_chats = _db_owner_chat_count(int(chat_id))
     if my_connections > 0:
@@ -2193,10 +2180,11 @@ async def _send_start(chat_id: int, *, set_owner: bool) -> None:
             f"✅ Бот подключён в Telegram для бизнеса. Подключений: {my_connections}. Чатов: {my_chats}.",
         )
     else:
-        await bot.send_message(
-            chat_id,
-            f"❗️ Пока нет подключённых бизнес-чатов. Добавьте @{bot_username} в Telegram для бизнеса → Чат-боты и начните переписку (вы можете написать кому-то сами).",
-        )
+        if _has_active_subscription(int(chat_id)):
+            await bot.send_message(
+                chat_id,
+                f"❗️ Пока нет подключённых бизнес-чатов. Добавьте @{bot_username} в Telegram для бизнеса → Чат-боты и начните переписку (вы можете написать кому-то сами).",
+            )
 
 
 async def _process_update(update: dict) -> None:
@@ -2244,7 +2232,18 @@ async def _process_update(update: dict) -> None:
                     _, seconds = p
                     until = _db_sub_extend(int(uid), int(seconds))
                     try:
-                        await bot.send_message(int(uid), f"✅ Оплата получена. Доступ активен до {_fmt_dt(until)}")
+                        await _send_premium_header(int(uid), "Оплата получена")
+                        await bot.send_message(int(uid), f"✅ Доступ активен до {_fmt_dt(until)}")
+                        if _db_count_business_connections_for_owner(int(uid)) == 0:
+                            await _send_premium_header(int(uid), "Подключение Telegram для бизнеса")
+                            bot_username = await _get_bot_username()
+                            await bot.send_message(
+                                int(uid),
+                                "1) Telegram → Telegram для бизнеса → Чат-боты\n"
+                                f"2) Добавьте <code>@{bot_username}</code>\n"
+                                "3) Напишите кому-то от имени бизнеса (или вам напишут)\n\n"
+                                "После первого сообщения бот привяжет бизнес-аккаунт.",
+                            )
                     except Exception:
                         logger.exception("Failed to confirm payment")
             return
@@ -2280,14 +2279,14 @@ async def _process_update(update: dict) -> None:
             if cid and owner_uid:
                 # Persist mapping for allowed owners even if they haven't started the bot yet.
                 # business_connection is authoritative for ownership (comes from Telegram).
-                if _db_is_whitelisted(int(owner_uid)):
+                if _has_active_subscription(int(owner_uid)):
                     prev_owner = _db_get_owner_by_connection(str(cid))
                     _db_set_business_connection(cid, owner_uid)
                     if prev_owner != int(owner_uid):
                         logger.info("Mapped business_connection %s: %s -> %s", cid, prev_owner, owner_uid)
                 # Notify owner immediately when bot is added to Telegram Business (once per connection)
                 # Only if bot can PM the owner.
-                if _db_mark_connection_notified(cid) and _db_is_bot_user(int(owner_uid)):
+                if _db_mark_connection_notified(cid) and _db_is_bot_user(int(owner_uid)) and _has_active_subscription(int(owner_uid)):
                     try:
                         await bot.send_message(
                             owner_uid,
@@ -2329,6 +2328,13 @@ async def _process_update(update: dict) -> None:
             logger.exception("Failed to answer callback_query")
 
         if not from_id:
+            return
+
+        if data == "noop":
+            return
+
+        if data == "open_sub":
+            await _send_subscription(int(from_id))
             return
 
         if isinstance(data, str) and data.startswith("buy:"):
@@ -2390,7 +2396,7 @@ async def _process_update(update: dict) -> None:
             return
 
         if data == "help":
-            await _send_help(int(from_id))
+            await bot.send_message(int(from_id), "Команда больше не используется.")
             return
 
         if data == "status":
@@ -2411,16 +2417,36 @@ async def _process_update(update: dict) -> None:
             await bot.send_message(int(from_id), "Отменено.")
             return
 
-        if data == "admin" and int(from_id) == int(ADMIN_ID):
+        if (data == "admin" or (isinstance(data, str) and data.startswith("admin_page:"))) and int(from_id) == int(ADMIN_ID):
+            per_page = 10
+            page = 1
+            if isinstance(data, str) and data.startswith("admin_page:"):
+                try:
+                    page = int(data.split(":", 1)[1])
+                except Exception:
+                    page = 1
+            if page < 1:
+                page = 1
+
             total_users = _db_stats_users_count()
-            users = _db_list_users(limit=8, offset=0)
+            total_pages = max(1, (int(total_users) + per_page - 1) // per_page)
+            if page > total_pages:
+                page = total_pages
+            offset = (page - 1) * per_page
+            users = _db_list_users(limit=per_page, offset=offset)
 
             paid_mode = _db_get_paid_mode()
 
-            lines = ["👑 Админка", "", f"Пользователей: {total_users}", "", "Пользователи:"]
+            lines = [
+                "👑 Админка",
+                "",
+                f"Пользователей: {total_users}",
+                f"Страница: {page}/{total_pages}",
+                "",
+                "Пользователи:",
+            ]
             kb_rows: list[list[InlineKeyboardButton]] = []
             entities: list[MessageEntity] = []
-            text_so_far = ""
             if users:
                 for u in users:
                     uid = int(u["user_id"])
@@ -2430,8 +2456,6 @@ async def _process_update(update: dict) -> None:
                     blocked = bool(u["blocked"])
 
                     line = f"- {uid} — {who}" + (" — 🚫 блок" if blocked else "")
-                    # compute entity offsets based on the final joined text
-                    # current text is lines + this line joined with \n
                     preview = "\n".join(lines + [line])
                     start = preview.rfind(who)
                     if start >= 0:
@@ -2445,13 +2469,16 @@ async def _process_update(update: dict) -> None:
                         )
 
                     lines.append(line)
-                    kb_rows.append(
-                        [
-                            InlineKeyboardButton(text=f"⚙️ {uid}", callback_data=f"admin_u:{uid}"),
-                        ]
-                    )
+                    kb_rows.append([InlineKeyboardButton(text=f"⚙️ {uid}", callback_data=f"admin_u:{uid}")])
             else:
                 lines.append("- пока нет пользователей")
+
+            nav_row: list[InlineKeyboardButton] = []
+            if page > 1:
+                nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_page:{page - 1}"))
+            nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="noop"))
+            if page < total_pages:
+                nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_page:{page + 1}"))
 
             kb_rows.insert(
                 0,
@@ -2464,6 +2491,8 @@ async def _process_update(update: dict) -> None:
                 ],
             )
             kb_rows.insert(1, [InlineKeyboardButton(text="⭐ Цены", callback_data="admin_prices")])
+            if nav_row:
+                kb_rows.insert(2, nav_row)
 
             kb_rows.append([InlineKeyboardButton(text="🚫 Черный список", callback_data="admin_blacklist")])
             kb_rows.append([InlineKeyboardButton(text="🧹 Очистить кэш", callback_data="admin_cache_clear")])
@@ -2579,12 +2608,6 @@ async def _process_update(update: dict) -> None:
                     ],
                     [
                         InlineKeyboardButton(
-                            text=("✅ В whitelist" if not _db_is_whitelisted(uid) else "❌ Убрать из whitelist"),
-                            callback_data=(f"admin_wl_add:{uid}" if not _db_is_whitelisted(uid) else f"admin_wl_del:{uid}"),
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
                             text=("🎁 Сделать бесплатным" if not is_free else "💰 Убрать бесплатный"),
                             callback_data=(f"admin_free_add:{uid}" if not is_free else f"admin_free_del:{uid}"),
                         )
@@ -2616,24 +2639,6 @@ async def _process_update(update: dict) -> None:
             await bot.send_message(int(from_id), f"💰 Пользователь {uid} убран из бесплатных")
             update2 = {"callback_query": {"data": f"admin_u:{uid}", "from": from_user}}
             await _process_update(update2)
-            return
-
-        if isinstance(data, str) and data.startswith("admin_wl_add:") and int(from_id) == int(ADMIN_ID):
-            try:
-                uid = int(data.split(":", 1)[1])
-            except Exception:
-                return
-            _db_set_whitelisted(uid, True)
-            await bot.send_message(int(from_id), f"✅ Пользователь {uid} добавлен в whitelist")
-            return
-
-        if isinstance(data, str) and data.startswith("admin_wl_del:") and int(from_id) == int(ADMIN_ID):
-            try:
-                uid = int(data.split(":", 1)[1])
-            except Exception:
-                return
-            _db_set_whitelisted(uid, False)
-            await bot.send_message(int(from_id), f"❌ Пользователь {uid} убран из whitelist")
             return
 
         if isinstance(data, str) and data.startswith("admin_block:") and int(from_id) == int(ADMIN_ID):
@@ -2690,7 +2695,7 @@ async def _process_update(update: dict) -> None:
                 if cid and chat_id_b is not None and sender_id_b is not None:
                     s_id = int(sender_id_b)
                     c_id = int(chat_id_b)
-                    if s_id != c_id and _db_is_bot_user(s_id) and _db_is_whitelisted(s_id):
+                    if s_id != c_id and _db_is_bot_user(s_id) and _has_active_subscription(s_id):
                         prev_owner = _db_get_owner_by_connection(str(cid))
                         if prev_owner != int(s_id):
                             _db_set_business_connection(str(cid), int(s_id))
@@ -2703,7 +2708,10 @@ async def _process_update(update: dict) -> None:
             if cid:
                 pending_owner = _db_business_bind_pick_pending_owner()
                 if pending_owner is not None and _db_business_bind_is_pending(int(pending_owner)):
-                    if _db_is_bot_user(int(pending_owner)) and _db_is_whitelisted(int(pending_owner)):
+                    if (
+                        _db_is_bot_user(int(pending_owner))
+                        and _has_active_subscription(int(pending_owner))
+                    ):
                         prev_owner = _db_get_owner_by_connection(str(cid))
                         if _db_upsert_business_connection_safe(str(cid), int(pending_owner)):
                             logger.info(
@@ -2727,7 +2735,7 @@ async def _process_update(update: dict) -> None:
             if cid:
                 mapped_owner = _db_get_owner_by_connection(str(cid))
                 chat_id_b = (m.get("chat") or {}).get("id")
-                if mapped_owner and chat_id_b is not None:
+                if mapped_owner and chat_id_b is not None and _has_active_subscription(int(mapped_owner)):
                     _db_owner_chat_add(int(mapped_owner), int(chat_id_b))
 
         chat_id = m.get("chat", {}).get("id")
@@ -2741,60 +2749,20 @@ async def _process_update(update: dict) -> None:
             if chat.get("type") == "private":
                 _db_mark_bot_user(int(chat_id))
 
-                # Access-code gating: only whitelisted users can use features (except admin)
-                if int(chat_id) != int(ADMIN_ID) and not _db_is_whitelisted(int(chat_id)):
-                    pending_kind = _db_access_get_pending(int(chat_id))
-                    txt_raw = (m.get("text") or "").strip()
-                    if txt_raw == "/start":
-                        _db_access_set_pending(int(chat_id), True, "user")
-                        await bot.send_message(int(chat_id), "🔐 Введите код доступа")
-                        return
-
-                    if txt == "⭐ Купить доступ":
-                        kb = _stars_buttons()
-                        await _send_premium_header(int(chat_id), "Оплата Telegram Stars")
-                        await bot.send_message(
-                            int(chat_id),
-                            "Выберите тариф. Оплата проходит в Telegram Stars.",
-                            reply_markup=kb,
-                        )
-                        return
-
-                    if pending_kind == "user":
-                        code = _db_get_access_code()
-                        if not code:
-                            await bot.send_message(int(chat_id), "⛔️ Доступ закрыт.")
-                            return
-                        if txt_raw == code:
-                            _db_access_set_pending(int(chat_id), False, "user")
-                            _db_set_whitelisted(int(chat_id), True)
-                            await bot.send_message(int(chat_id), "✅ Доступ открыт")
-                            await _send_start(int(chat_id), set_owner=False)
-                            return
-                        await bot.send_message(int(chat_id), "❌ Неверный код")
-                        return
-
-                    await bot.send_message(int(chat_id), "🔐 Для доступа нажмите /start и введите код")
-                    return
+                
 
                 # ReplyKeyboard menu commands
                 txt = (m.get("text") or "").strip()
                 if txt in {
-                    "📌 Инструкция",
                     "📊 Статус",
                     "🔒 Конфиденциальность",
                     "🆘 Техподдержка",
                     "🔗 Подключить бизнес",
-                    "⭐ Купить доступ",
                     "👑 Админка",
                     "🚫 Черный список",
                     "📣 Рассылка",
                     "❌ Отмена",
-                    "🔑 Код доступа",
                 }:
-                    if txt == "📌 Инструкция":
-                        await _send_help(int(chat_id))
-                        return
                     if txt == "📊 Статус":
                         await _send_status(int(chat_id))
                         return
@@ -2808,12 +2776,7 @@ async def _process_update(update: dict) -> None:
 
                     if txt == "🔗 Подключить бизнес":
                         if not _has_active_subscription(int(chat_id)):
-                            kb = _stars_buttons()
-                            await bot.send_message(
-                                int(chat_id),
-                                "⭐ Для подключения бизнеса нужен активный доступ. Выберите тариф:",
-                                reply_markup=kb,
-                            )
+                            await _send_subscription(int(chat_id))
                             return
                         my_connections = _db_count_business_connections_for_owner(int(chat_id))
                         my_chats = _db_owner_chat_count(int(chat_id))
@@ -2839,7 +2802,6 @@ async def _process_update(update: dict) -> None:
                     if txt == "❌ Отмена":
                         _db_support_set_pending(int(chat_id), False)
                         _db_broadcast_set_pending(int(chat_id), False)
-                        _db_access_set_pending(int(chat_id), False, "admin")
                         await bot.send_message(int(chat_id), "Отменено.")
                         return
                     if txt == "👑 Админка" and int(chat_id) == int(ADMIN_ID):
@@ -2852,16 +2814,7 @@ async def _process_update(update: dict) -> None:
                         await _process_update(update2)
                         return
 
-                    if txt == "🔑 Код доступа" and int(chat_id) == int(ADMIN_ID):
-                        cur = _db_get_access_code()
-                        await bot.send_message(
-                            int(chat_id),
-                            f"🔑 Текущий код: {cur if cur else '[не задан]'}\n\nОтправь новый код одним сообщением.",
-                        )
-                        _db_access_set_pending(int(chat_id), True, "admin")
-                        return
-
-                # Admin: set access code by next message
+                # Admin: set Stars prices by next message
                 if int(chat_id) == int(ADMIN_ID) and _db_access_get_pending(int(chat_id)) == "prices":
                     txt_raw = (m.get("text") or "").strip()
                     if txt_raw and txt_raw != "❌ Отмена":
@@ -2890,14 +2843,6 @@ async def _process_update(update: dict) -> None:
                             await bot.send_message(int(chat_id), "✅ Цены обновлены")
                             return
                         await bot.send_message(int(chat_id), "❌ Не понял формат. Пример: 7=15 14=25 30=45")
-                        return
-
-                if int(chat_id) == int(ADMIN_ID) and _db_access_get_pending(int(chat_id)) == "admin":
-                    txt_raw = (m.get("text") or "").strip()
-                    if txt_raw and txt_raw != "❌ Отмена":
-                        _db_set_access_code(txt_raw)
-                        _db_access_set_pending(int(chat_id), False, "admin")
-                        await bot.send_message(int(chat_id), "✅ Код обновлён")
                         return
 
                 # Broadcast flow (admin only): send next message to all users
@@ -3301,5 +3246,4 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
-
 
