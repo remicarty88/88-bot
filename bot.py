@@ -534,6 +534,8 @@ def _db_sub_get_paid_until(user_id: int) -> int:
     try:
         if _rtdb_enabled():
             row = _rtdb_get(f"subscriptions/{int(user_id)}")
+            if not isinstance(row, dict):
+                return 0
             return int(row.get("paid_until") or 0)
         with _db() as conn:
             row = conn.execute("SELECT paid_until FROM subscriptions WHERE user_id=?", (int(user_id),)).fetchone()
@@ -1103,7 +1105,7 @@ def _main_menu_kb(*, is_admin: bool, has_subscription: bool) -> ReplyKeyboardMar
         rows: list[list[KeyboardButton]] = [
             [KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")],
             [KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="❌ Отмена")],
-            [KeyboardButton(text="📊 Статус")],
+            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🔗 Подключить бизнес")],
         ]
         return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
@@ -2669,6 +2671,11 @@ async def _process_update(update: dict) -> None:
         m = update[key]
         sender = m.get("from") or {}
 
+        if key == "business_message":
+            owner_id = _target_owner_for_business(m)
+            if owner_id is not None and not _has_active_subscription(int(owner_id)):
+                return
+
         if key == "message":
             try:
                 chat_id_b = (m.get("chat") or {}).get("id")
@@ -2683,6 +2690,8 @@ async def _process_update(update: dict) -> None:
         # Business connection binding & per-owner chat tracking
         if key == "business_message":
             cid = _extract_business_connection_id(m)
+            chat_id_b = None
+            sender_id_b = None
 
             # Ownership recovery: if this is an outgoing business message, the sender is the business owner.
             # For incoming messages from the external participant, from.id == chat.id.
@@ -2704,39 +2713,44 @@ async def _process_update(update: dict) -> None:
                 logger.exception("Failed to recover business_connection owner")
 
             # Bind only when the owner explicitly requested binding (prevents cross-user leakage).
-            # Important: business_message.sender can be the external chat participant.
-            if cid:
-                pending_owner = _db_business_bind_pick_pending_owner()
-                if pending_owner is not None and _db_business_bind_is_pending(int(pending_owner)):
+            # Bind is allowed only on OUTGOING business messages (sender is the owner: from.id != chat.id)
+            if cid and chat_id_b is not None and sender_id_b is not None:
+                try:
+                    s_id = int(sender_id_b)
+                    c_id = int(chat_id_b)
                     if (
-                        _db_is_bot_user(int(pending_owner))
-                        and _has_active_subscription(int(pending_owner))
+                        s_id != c_id
+                        and _db_business_bind_is_pending(int(s_id))
+                        and _db_is_bot_user(int(s_id))
+                        and _has_active_subscription(int(s_id))
                     ):
                         prev_owner = _db_get_owner_by_connection(str(cid))
-                        if _db_upsert_business_connection_safe(str(cid), int(pending_owner)):
+                        if _db_upsert_business_connection_safe(str(cid), int(s_id)):
                             logger.info(
                                 "Rebound business_connection %s: %s -> %s",
                                 str(cid),
                                 prev_owner,
-                                int(pending_owner),
+                                int(s_id),
                             )
-                    _db_business_bind_clear(int(pending_owner))
-                    # Notify owner once (only if bot can PM)
-                    if _db_is_bot_user(int(pending_owner)):
-                        try:
-                            await bot.send_message(
-                                int(pending_owner),
-                                "✅ Бизнес-аккаунт привязан. Теперь уведомления будут приходить только по вашим бизнес-чатам.",
-                            )
-                        except TelegramForbiddenError:
-                            pass
+                        _db_business_bind_clear(int(s_id))
+                        # Notify owner once (only if bot can PM)
+                        if _db_is_bot_user(int(s_id)):
+                            try:
+                                await bot.send_message(
+                                    int(s_id),
+                                    "✅ Бизнес-аккаунт привязан. Теперь уведомления будут приходить только по вашим бизнес-чатам.",
+                                )
+                            except TelegramForbiddenError:
+                                pass
+                except Exception:
+                    logger.exception("Failed to bind business connection")
 
             # Track chats only when mapping exists
             if cid:
                 mapped_owner = _db_get_owner_by_connection(str(cid))
-                chat_id_b = (m.get("chat") or {}).get("id")
-                if mapped_owner and chat_id_b is not None and _has_active_subscription(int(mapped_owner)):
-                    _db_owner_chat_add(int(mapped_owner), int(chat_id_b))
+                chat_id_b2 = (m.get("chat") or {}).get("id")
+                if mapped_owner and chat_id_b2 is not None and _has_active_subscription(int(mapped_owner)):
+                    _db_owner_chat_add(int(mapped_owner), int(chat_id_b2))
 
         chat_id = m.get("chat", {}).get("id")
         msg_id = m.get("message_id")
@@ -2921,14 +2935,17 @@ async def _process_update(update: dict) -> None:
                 # Privacy-safe: forward only for business messages with a resolved owner mapping.
                 sender = (m.get("from") or {})
                 owner_id = _target_owner_for_business(m)
-                # If this update arrived in another bot user's stream, chat.id will be the other bot user.
-                # In that case, forward to chat.id (the real owner of the chat being monitored), not to the saver.
+                if owner_id is not None and not _has_active_subscription(int(owner_id)):
+                    owner_id = None
                 target_id = int(owner_id) if owner_id else None
-                try:
-                    if chat_id is not None and _db_is_bot_user(int(chat_id)):
-                        target_id = int(chat_id)
-                except Exception:
-                    pass
+                # Fallback: if we couldn't resolve the owner via business_connection_id,
+                # try routing to chat_id only if that chat_id is a known bot user.
+                if target_id is None:
+                    try:
+                        if chat_id is not None and _db_is_bot_user(int(chat_id)):
+                            target_id = int(chat_id)
+                    except Exception:
+                        pass
                 # Dedup by recipient (owner_id), not by chat_id, because Telegram can deliver the same reply
                 # via different business streams with different chat_id values.
                 if target_id and not _db_forwarded_get(int(target_id), int(r_msg_id), "ephemeral"):
@@ -2986,6 +3003,8 @@ async def _process_update(update: dict) -> None:
         edit_date = int(m.get("edit_date") or 0)
         if owner_id is None:
             _db_put_message(chat_id_i, msg_id_i, m)
+            return
+        if not _has_active_subscription(int(owner_id)):
             return
         notify_owners: set[int] = {int(owner_id)}
         prev = _db_get_message(chat_id_i, msg_id_i)
@@ -3059,6 +3078,8 @@ async def _process_update(update: dict) -> None:
 
         chat_id_i = int(chat_id)
         if owner_id is None:
+            return
+        if not _has_active_subscription(int(owner_id)):
             return
         notify_owners: set[int] = {int(owner_id)}
 
@@ -3246,4 +3267,6 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
+
+
 
