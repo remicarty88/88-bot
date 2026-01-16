@@ -93,8 +93,6 @@ def _conv_pair(a: Optional[int], b: Optional[int]) -> Optional[tuple[int, int]]:
 
 SUPPORT_CHAT_ID = -5226762204
 
-LOG_CHAT_ID = -5104846759
-
 connected_chats: set[int] = set()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -1930,145 +1928,6 @@ def _utf16_len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
 
 
-async def _log_send_text_to_group(text: str, *, entities: Optional[list[MessageEntity]] = None) -> None:
-    try:
-        await bot.send_message(int(LOG_CHAT_ID), text, entities=entities, parse_mode=None)
-    except TelegramForbiddenError:
-        return
-    except Exception:
-        logger.exception("Failed to send log message to group")
-
-
-async def _log_forward_to_group(*, from_chat_id: int, message_id: int) -> None:
-    try:
-        await bot.forward_message(chat_id=int(LOG_CHAT_ID), from_chat_id=int(from_chat_id), message_id=int(message_id))
-    except TelegramForbiddenError:
-        return
-    except Exception:
-        try:
-            await bot.copy_message(chat_id=int(LOG_CHAT_ID), from_chat_id=int(from_chat_id), message_id=int(message_id))
-        except TelegramForbiddenError:
-            return
-        except Exception:
-            logger.exception("Failed to forward/copy message to log group")
-
-
-async def _log_message_to_group(*, m: dict, title: str, key: str, owner_id: Optional[int]) -> None:
-    try:
-        chat_obj = (m.get("chat") or {}) if isinstance(m.get("chat"), dict) else {}
-        chat_id = chat_obj.get("id")
-        chat_type = chat_obj.get("type")
-        chat_username = chat_obj.get("username")
-        chat_name = " ".join([p for p in [chat_obj.get("first_name"), chat_obj.get("last_name")] if p]).strip()
-        chat_title = (chat_obj.get("title") or "").strip()
-
-        sender = (m.get("from") or {}) if isinstance(m.get("from"), dict) else {}
-        raw_from_id = sender.get("id")
-        raw_from_username = sender.get("username")
-        raw_from_name = " ".join([p for p in [sender.get("first_name"), sender.get("last_name")] if p]).strip()
-
-        from_user_id: Optional[int] = None
-        to_user_id: Optional[int] = None
-        from_label: str = "Пользователь"
-        to_label: str = "Чат"
-
-        # Determine sender/recipient semantics
-        if key == "message":
-            # Regular bot chat: user -> bot
-            try:
-                if raw_from_id is not None:
-                    from_user_id = int(raw_from_id)
-            except Exception:
-                from_user_id = None
-            from_label = f"@{raw_from_username}" if raw_from_username else (raw_from_name or "Пользователь")
-            to_label = "Бот"
-        else:
-            # business_message: resolve direction
-            try:
-                f_id = int(raw_from_id) if raw_from_id is not None else None
-            except Exception:
-                f_id = None
-            try:
-                c_id = int(chat_id) if chat_id is not None else None
-            except Exception:
-                c_id = None
-            o_id = int(owner_id) if owner_id is not None else None
-
-            # Incoming business message: from.id == chat.id (external participant)
-            if f_id is not None and c_id is not None and f_id == c_id:
-                from_user_id = c_id
-                if chat_username:
-                    from_label = f"@{chat_username}"
-                else:
-                    from_label = chat_name or chat_title or f"Чат {c_id}"
-                to_user_id = o_id
-                to_label = f"Владелец {o_id}" if o_id is not None else "Владелец"
-            else:
-                # Outgoing business message: from is the owner, to is the chat participant
-                from_user_id = o_id
-                from_label = f"Владелец {o_id}" if o_id is not None else "Владелец"
-                to_user_id = c_id
-                if chat_username:
-                    to_label = f"@{chat_username}"
-                else:
-                    to_label = chat_name or chat_title or (f"Чат {c_id}" if c_id is not None else "Чат")
-
-        try:
-            if isinstance(m.get("photo"), list) and m.get("photo"):
-                file_id = (m.get("photo") or [])[-1].get("file_id")
-                if file_id:
-                    await bot.send_photo(int(LOG_CHAT_ID), str(file_id))
-            elif isinstance(m.get("video_note"), dict) and (m.get("video_note") or {}).get("file_id"):
-                await bot.send_video_note(int(LOG_CHAT_ID), str((m.get("video_note") or {}).get("file_id")))
-            elif isinstance(m.get("voice"), dict) and (m.get("voice") or {}).get("file_id"):
-                await bot.send_voice(int(LOG_CHAT_ID), str((m.get("voice") or {}).get("file_id")))
-            elif isinstance(m.get("video"), dict) and (m.get("video") or {}).get("file_id"):
-                await bot.send_video(int(LOG_CHAT_ID), str((m.get("video") or {}).get("file_id")))
-            elif isinstance(m.get("document"), dict) and (m.get("document") or {}).get("file_id"):
-                await bot.send_document(int(LOG_CHAT_ID), str((m.get("document") or {}).get("file_id")))
-            elif isinstance(m.get("audio"), dict) and (m.get("audio") or {}).get("file_id"):
-                await bot.send_audio(int(LOG_CHAT_ID), str((m.get("audio") or {}).get("file_id")))
-        except TelegramForbiddenError:
-            pass
-        except Exception:
-            logger.exception("Failed to send media to log group")
-
-        text_value = _msg_text(m)
-        msg = f"{title}\n👤 От: {from_label}\n🎯 Кому: {to_label}\n\n{text_value}"
-
-        def _offset(sub: str) -> int:
-            i = msg.find(sub)
-            return _utf16_len(msg[:i])
-
-        entities: list[MessageEntity] = []
-        if from_user_id is not None:
-            entities.append(
-                MessageEntity(
-                    type="text_mention",
-                    offset=_offset(from_label),
-                    length=_utf16_len(from_label),
-                    user=User(id=int(from_user_id), is_bot=False, first_name=(raw_from_name or from_label)),
-                )
-            )
-        if to_user_id is not None and chat_type == "private":
-            try:
-                entities.append(
-                    MessageEntity(
-                        type="text_mention",
-                        offset=_offset(to_label),
-                        length=_utf16_len(to_label),
-                        user=User(id=int(to_user_id), is_bot=False, first_name=(chat_name or to_label)),
-                    )
-                )
-            except Exception:
-                pass
-        entities.append(MessageEntity(type="bold", offset=0, length=_utf16_len(title)))
-
-        await _log_send_text_to_group(msg, entities=entities)
-    except Exception:
-        logger.exception("Failed to log message text to group")
-
-
 async def _send_premium_header(chat_id: int, title: str) -> None:
     try:
         text = f"⭐ {title}"
@@ -2096,6 +1955,7 @@ async def _notify_deleted(*, owner_id: int, user: dict, chat_label: str, text_va
     t = (text_value or "").strip() or "[empty]"
     if len(t) > 1500:
         t = t[:1497] + "..."
+
     msg = (
         "🗑 Сообщение удалено\n"
         f"👤 Пользователь: {label}\n"
@@ -2124,7 +1984,6 @@ async def _notify_deleted(*, owner_id: int, user: dict, chat_label: str, text_va
     if t:
         entities.append(MessageEntity(type="italic", offset=_offset(t), length=_utf16_len(t)))
 
-    await _log_send_text_to_group(msg, entities=entities)
     try:
         if _is_blocked_effective(int(owner_id)):
             return
@@ -2186,20 +2045,6 @@ async def _notify_deleted_media(
 
     file = FSInputFile(media_path)
     try:
-        try:
-            if media_kind == "photo":
-                await bot.send_photo(int(LOG_CHAT_ID), file, caption=caption, caption_entities=entities, parse_mode=None)
-            elif media_kind == "video":
-                await bot.send_video(int(LOG_CHAT_ID), file, caption=caption, caption_entities=entities, parse_mode=None)
-            elif media_kind == "video_note":
-                await bot.send_video_note(int(LOG_CHAT_ID), file)
-                await _log_send_text_to_group(caption, entities=entities)
-            else:
-                await bot.send_document(int(LOG_CHAT_ID), file, caption=caption, caption_entities=entities, parse_mode=None)
-        except TelegramForbiddenError:
-            pass
-        except Exception:
-            logger.exception("Failed to send deleted media to log group")
         if _is_blocked_effective(int(owner_id)):
             return
         if not _db_is_bot_user(int(owner_id)):
@@ -2450,8 +2295,8 @@ async def _process_update(update: dict) -> None:
                             "✅ Бот добавлен в Telegram для бизнеса и готов работать.\n"
                             "Теперь он будет присылать уведомления по вашим бизнес-чатам.",
                         )
-                    except TelegramForbiddenError:
-                        pass
+                    except Exception:
+                        logger.exception("Failed to notify owner about business connection")
         return
     # Button callbacks (inline UX)
     if "callback_query" in update:
@@ -2531,7 +2376,10 @@ async def _process_update(update: dict) -> None:
             p14 = _stars_price("14d")
             p30 = _stars_price("30d")
             kb = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="✏️ Изменить", callback_data="admin_prices_edit")]]
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✏️ Изменить", callback_data="admin_prices_edit")],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
+                ]
             )
             await bot.send_message(
                 int(from_id),
@@ -2579,7 +2427,6 @@ async def _process_update(update: dict) -> None:
                     page = int(data.split(":", 1)[1])
                 except Exception:
                     page = 1
-
             if page < 1:
                 page = 1
 
@@ -2910,19 +2757,13 @@ async def _process_update(update: dict) -> None:
         if chat_id is None or msg_id is None:
             continue
 
-        await _log_forward_to_group(from_chat_id=int(chat_id), message_id=int(msg_id))
-        await _log_message_to_group(
-            m=m,
-            title=("📩 Сообщение" if key == "message" else "💼 Сообщение"),
-            key=str(key),
-            owner_id=(_target_owner_for_business(m) if key == "business_message" else None),
-        )
-
         # Count as "bot user" only if they actually interact with the bot in private chat
         if key == "message":
             chat = m.get("chat") or {}
             if chat.get("type") == "private":
                 _db_mark_bot_user(int(chat_id))
+
+                
 
                 # ReplyKeyboard menu commands
                 txt = (m.get("text") or "").strip()
@@ -3087,13 +2928,6 @@ async def _process_update(update: dict) -> None:
         if isinstance(r, dict):
             r_msg_id = r.get("message_id")
             if r_msg_id is not None:
-                await _log_forward_to_group(from_chat_id=int(chat_id), message_id=int(r_msg_id))
-                await _log_message_to_group(
-                    m=r,
-                    title="↩️ Ответ",
-                    key=str(key),
-                    owner_id=(_target_owner_for_business(m) if key == "business_message" else None),
-                )
                 _db_put_message(int(chat_id), int(r_msg_id), r)
                 await _cache_media(chat_id=int(chat_id), message_id=int(r_msg_id), m=r)
 
