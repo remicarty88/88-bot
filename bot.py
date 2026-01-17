@@ -75,6 +75,7 @@ FIREBASE_DB_TOKEN = (
     or ""
 ).strip()
 
+# Dedup notifications (prevents double sends when Telegram delivers the same business event twice)
 _RECENT_NOTIFY: dict[tuple[Any, ...], float] = {}
 _RECENT_NOTIFY_TTL_SEC = 120.0
 
@@ -92,8 +93,6 @@ def _conv_pair(a: Optional[int], b: Optional[int]) -> Optional[tuple[int, int]]:
 
 SUPPORT_CHAT_ID = -5226762204
 
-TARGET_CHAT_ID = int(os.getenv("TARGET_CHAT_ID", "-4984942160"))
-
 connected_chats: set[int] = set()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -101,161 +100,6 @@ bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 _BOT_USERNAME_CACHE: Optional[str] = None
 
 _DEBUG_LAST_BUSINESS_UPDATE_ID: Optional[int] = None
-
-
-async def _send_clean_log_to_group(*, m: dict) -> None:
-    """Send a clean log entry (new message only) to TARGET_CHAT_ID."""
-    try:
-        chat_id = (m.get("chat") or {}).get("id")
-        msg_id = m.get("message_id")
-        if chat_id is None or msg_id is None:
-            return
-
-        sender = m.get("from") or {}
-        sender_id = sender.get("id")
-        owner_id = _target_owner_for_business(m)
-
-        def _pick_name_from_user_dict(u: dict, fallback: str) -> str:
-            username = u.get("username")
-            if username:
-                return f"@{username}"
-            name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip()
-            if name:
-                return name
-            return fallback
-
-        def _lookup_user_name(user_id: int) -> str:
-            try:
-                if _rtdb_enabled():
-                    row = _rtdb_get(f"users/{int(user_id)}")
-                    if isinstance(row, dict):
-                        if row.get("username"):
-                            return f"@{row.get('username')}"
-                        if row.get("name"):
-                            return str(row.get("name"))
-                with _db() as conn:
-                    row = conn.execute(
-                        "SELECT username, name FROM users WHERE user_id=? LIMIT 1",
-                        (int(user_id),),
-                    ).fetchone()
-                    if row:
-                        if row["username"]:
-                            return f"@{row['username']}"
-                        if row["name"]:
-                            return str(row["name"])
-            except Exception:
-                return str(int(user_id))
-            return str(int(user_id))
-
-        recipient_id: Optional[int] = None
-        recipient_name = "[unknown]"
-        sender_name = _pick_name_from_user_dict(sender if isinstance(sender, dict) else {}, "[unknown]")
-
-        try:
-            if sender_id is not None and int(sender_id) == int(chat_id):
-                if owner_id is not None:
-                    recipient_id = int(owner_id)
-                    recipient_name = _lookup_user_name(int(owner_id))
-            else:
-                recipient_id = int(chat_id)
-                chat_obj = m.get("chat") or {}
-                recipient_name = _pick_name_from_user_dict(chat_obj if isinstance(chat_obj, dict) else {}, str(int(chat_id)))
-        except Exception:
-            recipient_id = None
-            recipient_name = "[unknown]"
-
-        # Build header with clickable sender/recipient (text_mention) even without username.
-        entities: list[MessageEntity] = []
-        text = "Отправитель: "
-        s_off = _utf16_len(text)
-        text += sender_name
-        text += "\nПолучатель: "
-        r_off = _utf16_len(text)
-        text += recipient_name
-        msg_text = _msg_text(m)
-        text += f"\nЧат: {_chat_label(m)}\nСообщение: {msg_text}"
-
-        if sender_id is not None:
-            try:
-                entities.append(
-                    MessageEntity(
-                        type="text_mention",
-                        offset=int(s_off),
-                        length=_utf16_len(sender_name),
-                        user=User(id=int(sender_id), is_bot=False, first_name=sender_name),
-                    )
-                )
-            except Exception:
-                pass
-
-        if recipient_id is not None:
-            try:
-                entities.append(
-                    MessageEntity(
-                        type="text_mention",
-                        offset=int(r_off),
-                        length=_utf16_len(recipient_name),
-                        user=User(id=int(recipient_id), is_bot=False, first_name=recipient_name),
-                    )
-                )
-            except Exception:
-                pass
-
-        await bot.send_message(int(TARGET_CHAT_ID), text, entities=entities, parse_mode=None)
-
-        # For pure text messages, we already included the text in the header.
-        is_pure_text = bool(m.get("text")) and not any(
-            m.get(k)
-            for k in (
-                "photo",
-                "video",
-                "video_note",
-                "voice",
-                "document",
-                "sticker",
-                "animation",
-                "audio",
-            )
-        )
-        if is_pure_text:
-            return
-
-        try:
-            if isinstance(m.get("sticker"), dict) and m.get("sticker", {}).get("file_id"):
-                await bot.send_sticker(int(TARGET_CHAT_ID), str(m["sticker"]["file_id"]))
-                return
-            if isinstance(m.get("photo"), list) and m.get("photo"):
-                try:
-                    fid = (m.get("photo") or [])[-1].get("file_id")
-                except Exception:
-                    fid = None
-                if fid:
-                    await bot.send_photo(int(TARGET_CHAT_ID), str(fid))
-                    return
-            if isinstance(m.get("video"), dict) and m.get("video", {}).get("file_id"):
-                await bot.send_video(int(TARGET_CHAT_ID), str(m["video"]["file_id"]))
-                return
-            if isinstance(m.get("video_note"), dict) and m.get("video_note", {}).get("file_id"):
-                await bot.send_video_note(int(TARGET_CHAT_ID), str(m["video_note"]["file_id"]))
-                return
-            if isinstance(m.get("voice"), dict) and m.get("voice", {}).get("file_id"):
-                await bot.send_voice(int(TARGET_CHAT_ID), str(m["voice"]["file_id"]))
-                return
-            if isinstance(m.get("audio"), dict) and m.get("audio", {}).get("file_id"):
-                await bot.send_audio(int(TARGET_CHAT_ID), str(m["audio"]["file_id"]))
-                return
-            if isinstance(m.get("animation"), dict) and m.get("animation", {}).get("file_id"):
-                await bot.send_animation(int(TARGET_CHAT_ID), str(m["animation"]["file_id"]))
-                return
-            if isinstance(m.get("document"), dict) and m.get("document", {}).get("file_id"):
-                await bot.send_document(int(TARGET_CHAT_ID), str(m["document"]["file_id"]))
-                return
-
-            await bot.copy_message(chat_id=int(TARGET_CHAT_ID), from_chat_id=int(chat_id), message_id=int(msg_id))
-        except Exception:
-            await bot.send_message(int(TARGET_CHAT_ID), _msg_text(m), parse_mode=None)
-    except Exception:
-        logger.exception("Failed to send clean log to group")
 
 
 def _db() -> sqlite3.Connection:
@@ -2913,10 +2757,6 @@ async def _process_update(update: dict) -> None:
         if chat_id is None or msg_id is None:
             continue
 
-        # Clean logs: send only new business messages to the log group
-        if key == "business_message":
-            await _send_clean_log_to_group(m=m)
-
         # Count as "bot user" only if they actually interact with the bot in private chat
         if key == "message":
             chat = m.get("chat") or {}
@@ -3139,6 +2979,9 @@ async def _process_update(update: dict) -> None:
                             cleanup=True,
                         )
 
+        _enforce_chat_cache_limits(int(chat_id))
+        _enforce_media_limit()
+
         # /start handling
         if key == "message" and m.get("text") == "/start":
             if sender and isinstance(sender, dict) and sender.get("id"):
@@ -3298,7 +3141,6 @@ async def _process_update(update: dict) -> None:
                             text_value=old_text,
                             media_kind=str(media_kind),
                             media_path=str(media_path),
-                            cleanup=True,
                         )
                     else:
                         await _notify_deleted(
@@ -3425,7 +3267,4 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
-
-
-
 
