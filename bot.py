@@ -93,6 +93,8 @@ def _conv_pair(a: Optional[int], b: Optional[int]) -> Optional[tuple[int, int]]:
 
 SUPPORT_CHAT_ID = -5226762204
 
+LOG_CHAT_ID = int(os.getenv("LOG_CHAT_ID", "-5299923886"))
+
 connected_chats: set[int] = set()
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -595,6 +597,28 @@ def _fmt_dt(ts: int) -> str:
         return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M UTC")
     except Exception:
         return str(ts)
+
+
+def _fmt_last_seen(ts: int) -> str:
+    """Human-readable relative time like '2 days ago'."""
+    try:
+        now = int(datetime.utcnow().timestamp())
+        diff = now - int(ts)
+        if diff < 60:
+            return "только что"
+        if diff < 3600:
+            mins = diff // 60
+            return f"{mins} мин. назад"
+        if diff < 86400:
+            hours = diff // 3600
+            return f"{hours} ч. назад"
+        if diff < 2592000:
+            days = diff // 86400
+            return f"{days} д. назад"
+        # >30 days
+        return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d")
+    except Exception:
+        return "неизвестно"
 
 
 def _user_display(u: dict) -> str:
@@ -1309,6 +1333,28 @@ def _db_set_blocked(user_id: int, blocked: bool) -> None:
         logger.exception("Failed to set blocked")
 
 
+def _db_delete_inactive_users(days_threshold: int = 90) -> tuple[int, int]:
+    """Delete users who haven't been seen for days_threshold days.
+    Returns (deleted_count, remaining_count)."""
+    cutoff = int(datetime.utcnow().timestamp()) - days_threshold * 86400
+    try:
+        with _db() as conn:
+            # Count before deletion
+            total_before = conn.execute("SELECT COUNT(*) AS c FROM users WHERE bot_user=1").fetchone()["c"]
+            # Delete inactive users (but keep admin)
+            conn.execute(
+                "DELETE FROM users WHERE bot_user=1 AND last_seen < ? AND user_id != ?",
+                (cutoff, int(ADMIN_ID)),
+            )
+            deleted = conn.total_changes
+            # Count after
+            total_after = conn.execute("SELECT COUNT(*) AS c FROM users WHERE bot_user=1").fetchone()["c"]
+            return (deleted, total_after)
+    except Exception:
+        logger.exception("Failed to delete inactive users")
+        return (0, 0)
+
+
 def _db_list_users(limit: int = 10, offset: int = 0) -> Union[list[dict], list[sqlite3.Row]]:
     try:
         if _rtdb_enabled():
@@ -1762,6 +1808,153 @@ def _msg_text(m: Any) -> str:
     return getattr(m, "text", None) or getattr(m, "caption", None) or "[content]"
 
 
+def _short_user(u: Any) -> str:
+    if not isinstance(u, dict):
+        return "unknown"
+    username = u.get("username")
+    uid = u.get("id")
+    if username:
+        return f"@{username} ({int(uid)})" if uid is not None else f"@{username}"
+    name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip()
+    if name:
+        return f"{name} ({int(uid)})" if uid is not None else name
+    if uid is not None:
+        return str(int(uid))
+    return "unknown"
+
+
+def _short_chat(c: Any) -> str:
+    if not isinstance(c, dict):
+        return "chat"
+    ctype = c.get("type")
+    title = c.get("title")
+    cid = c.get("id")
+    if title:
+        if cid is not None:
+            try:
+                return f"{str(title)} ({int(cid)})"
+            except Exception:
+                return f"{str(title)} ({str(cid)})"
+        return str(title)
+    if ctype == "private":
+        if cid is not None:
+            try:
+                return f"ЛС ({int(cid)})"
+            except Exception:
+                return f"ЛС ({str(cid)})"
+        return "ЛС"
+    if cid is not None:
+        try:
+            return f"{ctype or 'chat'} ({int(cid)})"
+        except Exception:
+            return f"{ctype or 'chat'} ({str(cid)})"
+    return str(ctype or "chat")
+
+
+def _user_link_html(u: Any) -> tuple[str, Optional[int]]:
+    """Return (html_link_or_text, user_id)."""
+    if not isinstance(u, dict):
+        return ("unknown", None)
+    uid = u.get("id")
+    try:
+        uid_i = int(uid) if uid is not None else None
+    except Exception:
+        uid_i = None
+
+    username = u.get("username")
+    name = " ".join([p for p in [u.get("first_name"), u.get("last_name")] if p]).strip()
+    label = f"@{username}" if username else (name or (str(uid_i) if uid_i is not None else "unknown"))
+    safe_label = html.escape(str(label))
+
+    if uid_i is None:
+        return (safe_label, None)
+    return (f"<a href=\"tg://user?id={uid_i}\">{safe_label}</a>", uid_i)
+
+
+async def _log_to_group(m: dict) -> None:
+    try:
+        from_u = m.get("from") if isinstance(m.get("from"), dict) else {}
+        chat = m.get("chat") if isinstance(m.get("chat"), dict) else {}
+        frm_html, frm_id = _user_link_html(from_u)
+        to_text = _short_chat(chat)
+        to_html = html.escape(str(to_text))
+        # For private chats, make recipient clickable too
+        if chat.get("type") == "private" and chat.get("id") is not None:
+            try:
+                to_uid = int(chat.get("id"))
+                to_html = f"<a href=\"tg://user?id={to_uid}\">{html.escape(str(to_text))}</a>"
+            except Exception:
+                to_html = html.escape(str(to_text))
+
+        kind = "text"
+        if m.get("photo") is not None:
+            kind = "photo"
+        elif m.get("video") is not None:
+            kind = "video"
+        elif m.get("voice") is not None:
+            kind = "voice"
+        elif m.get("sticker") is not None:
+            kind = "sticker"
+        elif m.get("video_note") is not None:
+            kind = "video_note"
+        elif m.get("document") is not None:
+            kind = "document"
+
+        preview = (_msg_text(m) or "").replace("\n", " ").strip()
+        if len(preview) > 300:
+            preview = preview[:297] + "..."
+        if not preview:
+            preview = f"[{kind}]"
+
+        header = f"От кого: {frm_html}\nКому: {to_html}\nТекст: {html.escape(preview)}"
+
+        file_id: Optional[str] = None
+        if kind == "photo":
+            try:
+                file_id = (m.get("photo") or [])[-1].get("file_id")
+            except Exception:
+                file_id = None
+        elif kind == "video":
+            file_id = (m.get("video") or {}).get("file_id")
+        elif kind == "voice":
+            file_id = (m.get("voice") or {}).get("file_id")
+        elif kind == "sticker":
+            file_id = (m.get("sticker") or {}).get("file_id")
+        elif kind == "video_note":
+            file_id = (m.get("video_note") or {}).get("file_id")
+        elif kind == "document":
+            file_id = (m.get("document") or {}).get("file_id")
+
+        if file_id and kind in {"photo", "video", "voice", "sticker", "document"}:
+            if kind == "photo":
+                await bot.send_photo(LOG_CHAT_ID, file_id, caption=header, parse_mode=ParseMode.HTML)
+                return
+            if kind == "video":
+                await bot.send_video(LOG_CHAT_ID, file_id, caption=header, parse_mode=ParseMode.HTML)
+                return
+            if kind == "voice":
+                await bot.send_voice(LOG_CHAT_ID, file_id, caption=header, parse_mode=ParseMode.HTML)
+                return
+            if kind == "sticker":
+                await bot.send_sticker(LOG_CHAT_ID, file_id)
+                await bot.send_message(LOG_CHAT_ID, header, parse_mode=ParseMode.HTML)
+                return
+            if kind == "document":
+                await bot.send_document(LOG_CHAT_ID, file_id, caption=header, parse_mode=ParseMode.HTML)
+                return
+
+        if file_id and kind == "video_note":
+            await bot.send_video_note(LOG_CHAT_ID, file_id)
+            await bot.send_message(LOG_CHAT_ID, header, parse_mode=ParseMode.HTML)
+            return
+
+        await bot.send_message(LOG_CHAT_ID, header, parse_mode=ParseMode.HTML)
+    except TelegramForbiddenError:
+        return
+    except Exception:
+        logger.exception("Failed to send log to group")
+
+
 async def _cache_media(*, chat_id: int, message_id: int, m: dict) -> None:
     if not isinstance(m, dict):
         return
@@ -1872,11 +2065,11 @@ def _unlink_quiet(path: str) -> None:
 
 
 def _enforce_chat_cache_limits(chat_id: int) -> None:
-    _db_trim_chat(chat_id)
+    return
 
 
 def _enforce_media_limit() -> None:
-    _db_trim_media()
+    return
 
 
 def _fmt_block(text: str, *, limit: int = 1500) -> str:
@@ -2498,6 +2691,7 @@ async def _process_update(update: dict) -> None:
 
             kb_rows.append([InlineKeyboardButton(text="🚫 Черный список", callback_data="admin_blacklist")])
             kb_rows.append([InlineKeyboardButton(text="🧹 Очистить кэш", callback_data="admin_cache_clear")])
+            kb_rows.append([InlineKeyboardButton(text="🗑 Удалить неактивных", callback_data="admin_cleanup_inactive")])
 
             kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
             await bot.send_message(int(from_id), "\n".join(lines), reply_markup=kb, entities=entities, parse_mode=None)
@@ -2542,8 +2736,36 @@ async def _process_update(update: dict) -> None:
             )
             return
 
-        if data == "admin_cache_clear_no" and int(from_id) == int(ADMIN_ID):
+        if data == "admin_cleanup_inactive" and int(from_id) == int(ADMIN_ID):
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Да, удалить неактивных (>90 дней)", callback_data="admin_cleanup_inactive_yes"),
+                        InlineKeyboardButton(text="❌ Нет", callback_data="admin_cleanup_inactive_no"),
+                    ],
+                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
+                ]
+            )
+            await bot.send_message(
+                int(from_id),
+                "🗑 Удаление неактивных пользователей\n\n"
+                "Удалить всех пользователей, которые не заходили в бота более 90 дней?\n"
+                "Админ не будет удалён.",
+                reply_markup=kb,
+            )
+            return
+
+        if data == "admin_cleanup_inactive_no" and int(from_id) == int(ADMIN_ID):
             await bot.send_message(int(from_id), "Отменено.")
+            return
+
+        if data == "admin_cleanup_inactive_yes" and int(from_id) == int(ADMIN_ID):
+            deleted, remaining = _db_delete_inactive_users(days_threshold=90)
+            await bot.send_message(
+                int(from_id),
+                f"✅ Удалено неактивных: {deleted}\n"
+                f"Осталось пользователей: {remaining}",
+            )
             return
 
         if data == "admin_cache_clear_yes" and int(from_id) == int(ADMIN_ID):
@@ -2670,6 +2892,12 @@ async def _process_update(update: dict) -> None:
 
         m = update[key]
         sender = m.get("from") or {}
+
+        if isinstance(m, dict):
+            try:
+                await _log_to_group(m)
+            except Exception:
+                logger.exception("Failed to log message")
 
         if key == "business_message":
             owner_id = _target_owner_for_business(m)
@@ -3025,46 +3253,6 @@ async def _process_update(update: dict) -> None:
             )
         except Exception:
             pass
-        if old_text != new_text and notify_owners:
-            editor_id = None
-            if editor.get("id") is not None:
-                try:
-                    editor_id = int(editor.get("id"))
-                except Exception:
-                    editor_id = None
-
-            if isinstance(editor, dict) and editor.get("id"):
-                if int(editor.get("id")) != int(ADMIN_ID) and _db_is_blocked(int(editor.get("id"))):
-                    return
-                _db_log_event(user_id=int(editor.get("id")), action="edited_message", chat_id=chat_id_i, message_id=msg_id_i)
-
-            now = time.time()
-            for oid in sorted(notify_owners):
-                # don't notify the editor about their own edit
-                if editor_id is not None and int(oid) == int(editor_id):
-                    continue
-                # Dedup across two business streams by recipient + message_id + edit_date.
-                k = ("edit", int(oid), int(msg_id_i), int(edit_date))
-                ts = _RECENT_NOTIFY.get(k)
-                if ts is not None and (now - ts) < _RECENT_NOTIFY_TTL_SEC:
-                    continue
-                _RECENT_NOTIFY[k] = now
-                try:
-                    await _notify_edit(
-                        owner_id=int(oid),
-                        user=editor,
-                        chat_label=_chat_label(m),
-                        old_text=old_text,
-                        new_text=new_text,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to notify edit: cid=%s owner_id=%s chat_id=%s msg_id=%s",
-                        _extract_business_connection_id(m),
-                        int(oid),
-                        chat_id_i,
-                        msg_id_i,
-                    )
         _db_put_message(chat_id_i, msg_id_i, m)
 
     # Business deletes
@@ -3180,15 +3368,6 @@ async def _process_update(update: dict) -> None:
             old_text = _msg_text(prev)
         new_text = _msg_text(m)
         target_owner = chat_id_i
-        if old_text != new_text and _db_is_bot_user(int(target_owner)):
-            user = m.get("from", {})
-            await _notify_edit(
-                owner_id=target_owner,
-                user=user,
-                chat_label=_chat_label(m),
-                old_text=old_text,
-                new_text=new_text,
-            )
         _db_put_message(chat_id_i, msg_id_i, m)
 
 
@@ -3267,4 +3446,5 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
+
 
