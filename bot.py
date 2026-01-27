@@ -36,12 +36,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Set BOT_TOKEN in .env or environment variables.")
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return bool(default)
-    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -53,8 +47,6 @@ MEDIA_DIR.mkdir(exist_ok=True)
 
 MAX_MESSAGES_PER_CHAT = 500
 MAX_MEDIA_FILES = 300
-
-DISABLE_LOG_LIMITS = _env_flag("DISABLE_LOG_LIMITS", True)
 
 DB_PATH = Path(os.getenv("DB_PATH", "bot.db"))
 
@@ -1527,8 +1519,6 @@ def _db_delete_media(chat_id: int, message_id: int) -> None:
 
 
 def _db_trim_chat(chat_id: int) -> None:
-    if DISABLE_LOG_LIMITS:
-        return
     # Keep only last MAX_MESSAGES_PER_CHAT
     try:
         with _db() as conn:
@@ -1551,8 +1541,6 @@ def _db_trim_chat(chat_id: int) -> None:
 
 
 def _db_trim_media() -> None:
-    if DISABLE_LOG_LIMITS:
-        return
     # Keep only last MAX_MEDIA_FILES media rows
     try:
         with _db() as conn:
@@ -1700,8 +1688,12 @@ def _stars_buttons() -> InlineKeyboardMarkup:
     )
 
 
+def _subscription_buttons() -> InlineKeyboardMarkup:
+    return _stars_buttons()
+
+
 async def _send_subscription(chat_id: int) -> None:
-    kb = _stars_buttons()
+    kb = _subscription_buttons()
     await _send_premium_header(int(chat_id), "Подписка")
     until = _db_sub_get_paid_until(int(chat_id))
     now = int(datetime.utcnow().timestamp())
@@ -1711,10 +1703,14 @@ async def _send_subscription(chat_id: int) -> None:
     else:
         status = "❌ Не активна"
         hint = "Чтобы подключить бизнес-чаты и получать уведомления — оформите подписку ниже."
+    bot_username = "PremiumBot"
+    bot_link = "https://t.me/PremiumBot"
     text = (
         "⭐ Доступ к бизнес-уведомлениям\n\n"
         f"Статус: {status}\n\n"
-        f"{hint}"
+        f"{hint}\n\n"
+        f"🤖 Официальный бот Telegram Premium: <a href=\"{html.escape(bot_link)}\">@{html.escape(bot_username)}</a>\n"
+        "💡 Выгодно покупать Telegram Premium в официальном боте."
     )
     await bot.send_message(int(chat_id), text, reply_markup=kb)
 
@@ -1884,14 +1880,10 @@ def _unlink_quiet(path: str) -> None:
 
 
 def _enforce_chat_cache_limits(chat_id: int) -> None:
-    if DISABLE_LOG_LIMITS:
-        return
     _db_trim_chat(chat_id)
 
 
 def _enforce_media_limit() -> None:
-    if DISABLE_LOG_LIMITS:
-        return
     _db_trim_media()
 
 
@@ -3283,6 +3275,8 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
+
+
 
 
 
