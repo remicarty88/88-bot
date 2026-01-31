@@ -45,8 +45,8 @@ logger = logging.getLogger(__name__)
 MEDIA_DIR = Path("media")
 MEDIA_DIR.mkdir(exist_ok=True)
 
-MAX_MESSAGES_PER_CHAT = 500
-MAX_MEDIA_FILES = 300
+MAX_MESSAGES_PER_CHAT = int(os.getenv("MAX_MESSAGES_PER_CHAT", "0"))
+MAX_MEDIA_FILES = int(os.getenv("MAX_MEDIA_FILES", "0"))
 
 DB_PATH = Path(os.getenv("DB_PATH", "bot.db"))
 
@@ -1521,6 +1521,8 @@ def _db_delete_media(chat_id: int, message_id: int) -> None:
 def _db_trim_chat(chat_id: int) -> None:
     # Keep only last MAX_MESSAGES_PER_CHAT
     try:
+        if int(MAX_MESSAGES_PER_CHAT) <= 0:
+            return
         with _db() as conn:
             rows = conn.execute(
                 "SELECT message_id FROM messages WHERE chat_id=? ORDER BY created_at DESC LIMIT -1 OFFSET ?",
@@ -1543,6 +1545,8 @@ def _db_trim_chat(chat_id: int) -> None:
 def _db_trim_media() -> None:
     # Keep only last MAX_MEDIA_FILES media rows
     try:
+        if int(MAX_MEDIA_FILES) <= 0:
+            return
         with _db() as conn:
             rows = conn.execute(
                 """
