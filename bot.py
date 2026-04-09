@@ -1103,15 +1103,15 @@ async def _send_support_prompt(user_id: int) -> None:
 def _main_menu_kb(*, is_admin: bool, has_subscription: bool) -> ReplyKeyboardMarkup:
     if is_admin:
         rows: list[list[KeyboardButton]] = [
-            [KeyboardButton(text="👑 Админка"), KeyboardButton(text="🚫 Черный список")],
-            [KeyboardButton(text="📣 Рассылка"), KeyboardButton(text="❌ Отмена")],
-            [KeyboardButton(text="📊 Статус"), KeyboardButton(text="🔗 Подключить бизнес")],
+            [KeyboardButton(text="💎 Админ-панель"), KeyboardButton(text="👤 Пользователи")],
+            [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="📊 Мой статус"), KeyboardButton(text="🚀 Бизнес-чат")],
         ]
         return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
 
     rows: list[list[KeyboardButton]] = [
-        [KeyboardButton(text="📊 Статус")],
-        [KeyboardButton(text="🔒 Конфиденциальность"), KeyboardButton(text="🆘 Техподдержка")],
+        [KeyboardButton(text="📊 Мой статус")],
+        [KeyboardButton(text="🛡 Безопасность"), KeyboardButton(text="👨‍💻 Поддержка")],
         [KeyboardButton(text="🔗 Подключить бизнес")],
     ]
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
@@ -1174,30 +1174,47 @@ async def _send_broadcast_prompt(chat_id: int) -> None:
 
 
 async def _send_status(chat_id: int) -> None:
-    # Privacy-safe status
-    is_admin = int(chat_id) == int(ADMIN_ID)
-    connections_count = _db_count_business_connections_for_owner(int(chat_id))
-    chats_count = _db_owner_chat_count(int(chat_id))
-    wl = True
-
-    lines = ["📊 Статус", "", f"• Ваш ID: {int(chat_id)}"]
-    lines.append(f"• Доступ: {'✅ открыт' if not _is_blocked_effective(int(chat_id)) else '🚫 заблокирован'}")
-    if int(chat_id) == int(ADMIN_ID):
-        lines.append("• Подписка: 👑 админ (бесплатно)")
-    else:
+    try:
         until = _db_sub_get_paid_until(int(chat_id))
-        if until > int(datetime.utcnow().timestamp()):
-            lines.append(f"• Подписка: ✅ активна до {_fmt_dt(until)}")
+        now = int(datetime.utcnow().timestamp())
+        
+        await _send_premium_header(chat_id, "ВАШ СТАТУС")
+        
+        is_admin = int(chat_id) == int(ADMIN_ID)
+        connections_count = _db_count_business_connections_for_owner(int(chat_id))
+        chats_count = _db_owner_chat_count(int(chat_id))
+        
+        await _send_premium_header(chat_id, "ВАШ СТАТУС")
+        
+        lines = [
+            "<b>📊 ИНФОРМАЦИЯ ОБ АККАУНТЕ</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"🆔 <b>Ваш ID:</b> <code>{chat_id}</code>",
+        ]
+        
+        if until > now:
+            lines.append(f"🌟 <b>Подписка:</b> <code>Активна</code>")
+            lines.append(f"📅 <b>Истекает:</b> <code>{_fmt_dt(until)}</code>")
         else:
-            lines.append("• Подписка: ❌ нет")
-    lines.append(f"• Бизнес-подключений (для вашего аккаунта): {connections_count}")
-    lines.append(f"• Подключённые бизнес-чаты (для вашего аккаунта): {chats_count}")
+            lines.append(f"❌ <b>Подписка:</b> <code>Не активна</code>")
+            
+        my_connections = _db_count_business_connections_for_owner(int(chat_id))
+        my_chats = _db_owner_chat_count(int(chat_id))
+        
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"🔗 <b>Бизнес-аккаунты:</b> <code>{my_connections}</code>")
+        lines.append(f"💬 <b>Всего чатов:</b> <code>{my_chats}</code>")
+        
+        if int(chat_id) == int(ADMIN_ID):
+            owner = _db_get_owner_id()
+            lines.append("━━━━━━━━━━━━━━━━━━━━")
+            lines.append(f"👑 <b>ADMIN MODE:</b> <code>ON</code>")
+            if owner:
+                lines.append(f"👤 <b>OWNER_ID:</b> <code>{owner}</code>")
 
-    if is_admin:
-        owner = _db_get_owner_id()
-        lines.append(f"• OWNER_ID (владелец/админ): {owner if owner else 'не задан'}")
-
-    await bot.send_message(int(chat_id), "\n".join(lines))
+        await bot.send_message(int(chat_id), "\n".join(lines), parse_mode=ParseMode.HTML)
+    except Exception:
+        logger.exception("Failed to send status")
 
 
 async def _send_privacy(chat_id: int) -> None:
@@ -1684,10 +1701,10 @@ def _stars_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text=f"7 дней — {p7}⭐", callback_data="buy:7d"),
-                InlineKeyboardButton(text=f"14 дней — {p14}⭐", callback_data="buy:14d"),
+                InlineKeyboardButton(text=f"🗓 7 дней — {p7}⭐", callback_data="buy:7d"),
+                InlineKeyboardButton(text=f"🗓 14 дней — {p14}⭐", callback_data="buy:14d"),
             ],
-            [InlineKeyboardButton(text=f"30 дней — {p30}⭐", callback_data="buy:30d")],
+            [InlineKeyboardButton(text=f"🔥 30 дней — {p30}⭐", callback_data="buy:30d")],
         ]
     )
 
@@ -1698,25 +1715,26 @@ def _subscription_buttons() -> InlineKeyboardMarkup:
 
 async def _send_subscription(chat_id: int) -> None:
     kb = _subscription_buttons()
-    await _send_premium_header(int(chat_id), "Подписка")
+    await _send_premium_header(int(chat_id), "PREMIUM ДОСТУП")
     until = _db_sub_get_paid_until(int(chat_id))
     now = int(datetime.utcnow().timestamp())
-    if until > now:
-        status = f"✅ Активна до {_fmt_dt(until)}"
-        hint = "Вы можете продлить доступ заранее — срок добавится сверху."
-    else:
-        status = "❌ Не активна"
-        hint = "Чтобы подключить бизнес-чаты и получать уведомления — оформите подписку ниже."
-    bot_username = "PremiumBot"
-    bot_link = "https://t.me/PremiumBot"
+    
     text = (
-        "⭐ Доступ к бизнес-уведомлениям\n\n"
-        f"Статус: {status}\n\n"
-        f"{hint}\n\n"
-        f"🤖 Официальный бот Telegram Premium: <a href=\"{html.escape(bot_link)}\">@{html.escape(bot_username)}</a>\n"
-        "💡 Выгодно покупать Telegram Premium в официальном боте."
+        "<b>💎 ПРЕИМУЩЕСТВА PREMIUM ДОСТУПА</b>\n\n"
+        "🔓 Разблокировка всех функций мониторинга\n"
+        "⚡️ Мгновенные уведомления без задержек\n"
+        "📥 Безлимитное хранение удаленных медиа\n"
+        "🧑‍💻 Приоритетная поддержка\n\n"
     )
-    await bot.send_message(int(chat_id), text, reply_markup=kb)
+    
+    if until > now:
+        text += f"✅ <b>Ваш статус:</b> <code>Активен до {_fmt_dt(until)}</code>\n\n"
+    else:
+        text += "❌ <b>Ваш статус:</b> <code>Доступ ограничен</code>\n\n"
+        
+    text += "<b>💳 ВЫБЕРИТЕ ТАРИФНЫЙ ПЛАН:</b>"
+    
+    await bot.send_message(int(chat_id), text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
 def _user_link(u: dict) -> str:
@@ -1795,6 +1813,12 @@ async def _cache_media(*, chat_id: int, message_id: int, m: dict) -> None:
     elif m.get("video_note"):
         kind = "video_note"
         file_id = (m.get("video_note") or {}).get("file_id")
+    elif m.get("voice"):
+        kind = "voice"
+        file_id = (m.get("voice") or {}).get("file_id")
+    elif m.get("audio"):
+        kind = "audio"
+        file_id = (m.get("audio") or {}).get("file_id")
     elif m.get("document"):
         kind = "document"
         file_id = (m.get("document") or {}).get("file_id")
@@ -1824,34 +1848,12 @@ async def _send_media_to_owner(
     note: str,
     cleanup: bool,
 ) -> None:
-    user_id = sender.get("id")
-    username = sender.get("username")
-    name = " ".join([p for p in [sender.get("first_name"), sender.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     header = (
-        "⏳ Медиа с таймером сохранено\n"
-        f"👤 Пользователь: {label}\n"
+        "⏳ <b>Медиа с таймером сохранено</b>\n"
+        f"👤 {_user_link(sender)}\n"
         f"💬 {chat_label}"
-        + ("\n\n" + note if note else "")
+        + ("\n\n" + _fmt_block(note, limit=900) if note else "")
     )
-
-    def _offset(sub: str) -> int:
-        i = header.find(sub)
-        return _utf16_len(header[:i])
-
-    entities: list[MessageEntity] = []
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-    title = "Медиа с таймером сохранено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
 
     file = FSInputFile(media_path)
     try:
@@ -1865,10 +1867,14 @@ async def _send_media_to_owner(
             await bot.send_video(owner_id, file)
         elif media_kind == "video_note":
             await bot.send_video_note(owner_id, file)
+        elif media_kind == "voice":
+            await bot.send_voice(owner_id, file)
+        elif media_kind == "audio":
+            await bot.send_audio(owner_id, file)
         else:
             await bot.send_document(owner_id, file)
 
-        await bot.send_message(owner_id, header, entities=entities, parse_mode=None)
+        await bot.send_message(owner_id, header, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except TelegramForbiddenError:
         return
     finally:
@@ -1884,11 +1890,13 @@ def _unlink_quiet(path: str) -> None:
 
 
 def _enforce_chat_cache_limits(chat_id: int) -> None:
-    _db_trim_chat(chat_id)
+    # Unlimited cache: don't auto-trim stored messages
+    return
 
 
 def _enforce_media_limit() -> None:
-    _db_trim_media()
+    # Unlimited cache: don't auto-trim stored media
+    return
 
 
 def _fmt_block(text: str, *, limit: int = 1500) -> str:
@@ -1958,50 +1966,23 @@ async def _send_premium_header(chat_id: int, title: str) -> None:
 
 
 async def _notify_deleted(*, owner_id: int, user: dict, chat_label: str, text_value: str) -> None:
-    user_id = user.get("id")
-    username = user.get("username")
-
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     t = (text_value or "").strip() or "[empty]"
     if len(t) > 1500:
         t = t[:1497] + "..."
 
     msg = (
-        "🗑 Сообщение удалено\n"
-        f"👤 Пользователь: {label}\n"
+        "🗑 <b>Сообщение удалено</b>\n"
+        f"👤 {_user_link(user)}\n"
         f"💬 {chat_label}\n\n"
-        f"{t}"
+        f"{_fmt_block(t)}"
     )
-
-    def _offset(sub: str) -> int:
-        i = msg.find(sub)
-        return _utf16_len(msg[:i])
-
-    entities: list[MessageEntity] = []
-
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    title = "Сообщение удалено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-    if t:
-        entities.append(MessageEntity(type="italic", offset=_offset(t), length=_utf16_len(t)))
 
     try:
         if _is_blocked_effective(int(owner_id)):
             return
         if not _db_is_bot_user(int(owner_id)):
             return
-        await bot.send_message(owner_id, msg, entities=entities, parse_mode=None)
+        await bot.send_message(owner_id, msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except TelegramForbiddenError:
         return
 
@@ -2016,11 +1997,6 @@ async def _notify_deleted_media(
     media_path: str,
     cleanup: bool,
 ) -> None:
-    user_id = user.get("id")
-    username = user.get("username")
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     t = (text_value or "").strip() or "[empty]"
     if len(t) > 900:
         t = t[:897] + "..."
@@ -2030,30 +2006,11 @@ async def _notify_deleted_media(
         t = ""
 
     caption = (
-        "🗑 Сообщение удалено\n"
-        f"👤 Пользователь: {label}\n"
+        "🗑 <b>Сообщение удалено</b>\n"
+        f"👤 {_user_link(user)}\n"
         f"💬 {chat_label}"
-        + ("\n\n" + t if t else "")
+        + ("\n\n" + _fmt_block(t, limit=900) if t else "")
     )
-
-    def _offset(sub: str) -> int:
-        i = caption.find(sub)
-        return _utf16_len(caption[:i])
-
-    entities: list[MessageEntity] = []
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    title = "Сообщение удалено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-    entities.append(MessageEntity(type="italic", offset=_offset(t), length=_utf16_len(t)))
 
     file = FSInputFile(media_path)
     try:
@@ -2062,19 +2019,23 @@ async def _notify_deleted_media(
         if not _db_is_bot_user(int(owner_id)):
             return
         if media_kind == "photo":
-            await bot.send_photo(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_photo(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         elif media_kind == "video":
-            await bot.send_video(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_video(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         elif media_kind == "video_note":
             # video_note doesn't support captions in Bot API, so send note first, then a text with details
             await bot.send_video_note(owner_id, file)
-            await bot.send_message(owner_id, caption, entities=entities, parse_mode=None)
+            await bot.send_message(owner_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        elif media_kind == "voice":
+            await bot.send_voice(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
+        elif media_kind == "audio":
+            await bot.send_audio(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            await bot.send_document(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_document(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Failed to send deleted media")
         try:
-            await bot.send_message(owner_id, caption, entities=entities, parse_mode=None)
+            await bot.send_message(owner_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except TelegramForbiddenError:
             pass
     finally:
@@ -2085,65 +2046,17 @@ async def _notify_deleted_media(
 
 
 async def _notify_edit(*, owner_id: int, user: dict, chat_label: str, old_text: str, new_text: str) -> None:
-    """Send notification about an edit.
-
-    Uses entities (text_mention + bold + pre) so the profile is clickable and layout is clean.
-    """
-    user_id = user.get("id")
-    username = user.get("username")
-
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
-    old_t = (old_text or "").strip() or "[empty]"
-    new_t = (new_text or "").strip() or "[empty]"
-    if len(old_t) > 1500:
-        old_t = old_t[:1497] + "..."
-    if len(new_t) > 1500:
-        new_t = new_t[:1497] + "..."
-
-    text = (
-        "✏️ Сообщение изменено\n"
-        f"👤 Пользователь: {label}\n"
-        f"💬 {chat_label}\n\n"
-        "🕓 Было:\n"
-        f"{old_t}\n\n"
-        "🆕 Стало:\n"
-        f"{new_t}"
-    )
-
-    def _offset(sub: str) -> int:
-        i = text.find(sub)
-        return _utf16_len(text[:i])
-
-    entities: list[MessageEntity] = []
-
-    # Make label clickable
-    if user_id:
-        start = _offset(label)
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=start,
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    # Bold only the main title
-    title = "Сообщение изменено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-
-    # Make the old text italic; new text stays plain (no formatting)
-    old_start = _offset(old_t)
-    entities.append(MessageEntity(type="italic", offset=old_start, length=_utf16_len(old_t)))
-
     try:
         if _is_blocked_effective(int(owner_id)):
             return
         if not _db_is_bot_user(int(owner_id)):
             return
-        await bot.send_message(owner_id, text, entities=entities, parse_mode=None)
+        await bot.send_message(
+            owner_id,
+            _build_edit_notify(user=user, chat_label=chat_label, old_text=old_text, new_text=new_text),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except TelegramForbiddenError:
         return
 
@@ -2154,50 +2067,67 @@ async def _send_start(chat_id: int, *, set_owner: bool) -> None:
         OWNER_ID = chat_id
         _db_set_owner_id(chat_id)
     bot_username = await _get_bot_username()
-
     is_admin = int(chat_id) == int(ADMIN_ID)
     has_sub = _has_active_subscription(int(chat_id))
     menu = _main_menu_kb(is_admin=is_admin, has_subscription=bool(has_sub))
-    await _send_premium_header(chat_id, "Добро пожаловать!")
+    
+    await _send_premium_header(chat_id, "88 BUSINESS BOT")
+    
     text = (
-        "🕵️‍♂️ Этот бот помогает следить за вашими бизнес-чатами.\n\n"
-        "Что он умеет:\n"
-        "• Уведомляет об изменениях сообщений ✏️\n"
-        "• Уведомляет об удалениях 🗑\n"
-        "• Сохраняет исчезающие фото/видео при ответе ⏳"
+        "<b>👋 Добро пожаловать в элитный сервис бизнес-мониторинга!</b>\n\n"
+        "<i>Этот бот — ваш персональный ассистент для полного контроля над Telegram Business чатами.</i>\n\n"
+        "<b>💎 НАШИ ВОЗМОЖНОСТИ:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔸 <b>Анализ правок:</b> видим, что изменил собеседник ✍️\n"
+        "🔸 <b>Анти-удаление:</b> сохраняем всё, что было удалено 🗑\n"
+        "🔸 <b>Медиа-контроль:</b> перехват исчезающих фото и видео ⏳\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "✨ <i>Используйте меню ниже для управления сервисом.</i>"
     )
-    await bot.send_message(chat_id, text, reply_markup=menu)
+    await bot.send_message(chat_id, text, reply_markup=menu, parse_mode=ParseMode.HTML)
 
     if int(chat_id) != int(ADMIN_ID) and _db_get_paid_mode() and not has_sub:
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⭐ Подписка / продлить", callback_data="open_sub")]]
+            inline_keyboard=[[InlineKeyboardButton(text="💎 АКТИВИРОВАТЬ ДОСТУП", callback_data="open_sub")]]
         )
         await bot.send_message(
             int(chat_id),
-            "🔒 Доступ к подключению бизнес-чатов сейчас не активен.\n"
-            "Оформите подписку в Telegram Stars — и сможете подключить Telegram для бизнеса.",
+            "🔒 <b>ДОСТУП ОГРАНИЧЕН</b>\n\n"
+            "Для подключения бизнес-функций необходима активная лицензия.\n"
+            "Воспользуйтесь Telegram Stars для мгновенной активации.",
             reply_markup=kb,
+            parse_mode=ParseMode.HTML
         )
 
     if has_sub:
         await bot.send_message(
             int(chat_id),
-            "🔗 Подключение Telegram для бизнеса:\n"
-            "Telegram → Telegram для бизнеса → Чат-боты → добавить:\n"
-            f"<code>@{bot_username}</code>",
+            "🚀 <b>ИНСТРУКЦИЯ ПО ПОДКЛЮЧЕНИЮ:</b>\n\n"
+            "1️⃣ Перейдите в <b>Настройки → Telegram для бизнеса</b>\n"
+            "2️⃣ Выберите раздел <b>Чат-боты</b>\n"
+            "3️⃣ Нажмите <b>Добавить</b> и введите:\n"
+            f"👉 <code>@{bot_username}</code>\n\n"
+            "<i>После добавления бот начнет мгновенно транслировать важные события из ваших чатов.</i>",
+            parse_mode=ParseMode.HTML
         )
+
     my_connections = _db_count_business_connections_for_owner(int(chat_id))
     my_chats = _db_owner_chat_count(int(chat_id))
     if my_connections > 0:
         await bot.send_message(
             chat_id,
-            f"✅ Бот подключён в Telegram для бизнеса. Подключений: {my_connections}. Чатов: {my_chats}.",
+            f"✅ <b>СТАТУС: ПОДКЛЮЧЕНО</b>\n\n"
+            f"📊 <b>Активных соединений:</b> <code>{my_connections}</code>\n"
+            f"💬 <b>Всего чатов в базе:</b> <code>{my_chats}</code>",
+            parse_mode=ParseMode.HTML
         )
     else:
         if _has_active_subscription(int(chat_id)):
             await bot.send_message(
                 chat_id,
-                f"❗️ Пока нет подключённых бизнес-чатов. Добавьте @{bot_username} в Telegram для бизнеса → Чат-боты и начните переписку (вы можете написать кому-то сами).",
+                f"⚠️ <b>ВНИМАНИЕ</b>\n\n"
+                f"Бизнес-аккаунт еще не привязан. Добавьте <code>@{bot_username}</code> в настройках Telegram для бизнеса.",
+                parse_mode=ParseMode.HTML
             )
 
 
@@ -2389,18 +2319,19 @@ async def _process_update(update: dict) -> None:
             p30 = _stars_price("30d")
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
-                    [InlineKeyboardButton(text="✏️ Изменить", callback_data="admin_prices_edit")],
+                    [InlineKeyboardButton(text="📝 Редактировать цены", callback_data="admin_prices_edit")],
                     [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
                 ]
             )
             await bot.send_message(
                 int(from_id),
-                "⭐ Цены Stars\n\n"
-                f"7 дней: {p7}⭐\n"
-                f"14 дней: {p14}⭐\n"
-                f"30 дней: {p30}⭐\n\n"
-                "Нажми ✏️ Изменить, затем отправь одним сообщением: 7=15 14=25 30=45",
+                "<b>⭐ НАСТРОЙКА ЦЕН (STARS)</b>\n\n"
+                f"🗓 <b>7 дней:</b> <code>{p7}</code> ⭐\n"
+                f"🗓 <b>14 дней:</b> <code>{p14}</code> ⭐\n"
+                f"🗓 <b>30 дней:</b> <code>{p30}</code> ⭐\n\n"
+                "<i>Чтобы изменить, нажми кнопку ниже и отправь сообщение в формате: 7=15 14=25 30=45</i>",
                 reply_markup=kb,
+                parse_mode=ParseMode.HTML
             )
             return
 
@@ -2439,8 +2370,6 @@ async def _process_update(update: dict) -> None:
                     page = int(data.split(":", 1)[1])
                 except Exception:
                     page = 1
-            if page < 1:
-                page = 1
 
             total_users = _db_stats_users_count()
             total_pages = max(1, (int(total_users) + per_page - 1) // per_page)
@@ -2452,67 +2381,65 @@ async def _process_update(update: dict) -> None:
             paid_mode = _db_get_paid_mode()
 
             lines = [
-                "👑 Админка",
+                "<b>💎 ПАНЕЛЬ УПРАВЛЕНИЯ 💎</b>",
                 "",
-                f"Пользователей: {total_users}",
-                f"Страница: {page}/{total_pages}",
+                f"👤 <b>Всего пользователей:</b> <code>{total_users}</code>",
+                f"📃 <b>Страница:</b> <code>{page}/{total_pages}</code>",
                 "",
-                "Пользователи:",
+                "<b>👥 СПИСОК ПОЛЬЗОВАТЕЛЕЙ:</b>",
             ]
             kb_rows: list[list[InlineKeyboardButton]] = []
             entities: list[MessageEntity] = []
+            
+            # Статистика и глобальные настройки (в топ)
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=("🟢 Платный режим: ON" if paid_mode else "🔴 Платный режим: OFF"),
+                    callback_data="admin_paid_toggle",
+                ),
+                InlineKeyboardButton(text="⭐ Цены", callback_data="admin_prices")
+            ])
+            
+            kb_rows.append([
+                InlineKeyboardButton(text="🎁 Free-List", callback_data="admin_free_list"),
+                InlineKeyboardButton(text="🚫 Blacklist", callback_data="admin_blacklist")
+            ])
+
             if users:
                 for u in users:
                     uid = int(u["user_id"])
                     uname = u["username"]
                     name = u["name"]
-                    who = (f"@{uname}" if uname else (name or f"Пользователь {uid}")).strip()
+                    who = (f"@{uname}" if uname else (name or f"ID: {uid}")).strip()
                     blocked = bool(u["blocked"])
 
-                    line = f"- {uid} — {who}" + (" — 🚫 блок" if blocked else "")
-                    preview = "\n".join(lines + [line])
-                    start = preview.rfind(who)
-                    if start >= 0:
-                        entities.append(
-                            MessageEntity(
-                                type="text_mention",
-                                offset=_utf16_len(preview[:start]),
-                                length=_utf16_len(who),
-                                user=User(id=uid, is_bot=False, first_name=(name or (uname or str(uid)))),
-                            )
-                        )
-
+                    status_icon = "🚫" if blocked else "👤"
+                    line = f"{status_icon} <code>{uid}</code> — {who}"
+                    
                     lines.append(line)
-                    kb_rows.append([InlineKeyboardButton(text=f"⚙️ {uid}", callback_data=f"admin_u:{uid}")])
+                    # Кнопки управления пользователями в ряд по 2 для компактности
+                    if not kb_rows or len(kb_rows[-1]) >= 2 or "admin_u:" not in kb_rows[-1][0].callback_data:
+                         kb_rows.append([InlineKeyboardButton(text=f"⚙️ {uid}", callback_data=f"admin_u:{uid}")])
+                    else:
+                         kb_rows[-1].append(InlineKeyboardButton(text=f"⚙️ {uid}", callback_data=f"admin_u:{uid}"))
             else:
-                lines.append("- пока нет пользователей")
+                lines.append("<i>— Пользователей пока нет —</i>")
 
+            # Навигация
             nav_row: list[InlineKeyboardButton] = []
             if page > 1:
-                nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"admin_page:{page - 1}"))
-            nav_row.append(InlineKeyboardButton(text=f"{page}/{total_pages}", callback_data="noop"))
+                nav_row.append(InlineKeyboardButton(text="⬅️ Пред.", callback_data=f"admin_page:{page - 1}"))
+            
             if page < total_pages:
-                nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"admin_page:{page + 1}"))
-
-            kb_rows.insert(
-                0,
-                [
-                    InlineKeyboardButton(
-                        text=("💰 Платный режим: ВКЛ" if paid_mode else "💸 Платный режим: ВЫКЛ"),
-                        callback_data="admin_paid_toggle",
-                    ),
-                    InlineKeyboardButton(text="🎁 Бесплатные", callback_data="admin_free_list"),
-                ],
-            )
-            kb_rows.insert(1, [InlineKeyboardButton(text="⭐ Цены", callback_data="admin_prices")])
+                nav_row.append(InlineKeyboardButton(text="След. ➡️", callback_data=f"admin_page:{page + 1}"))
+            
             if nav_row:
-                kb_rows.insert(2, nav_row)
+                kb_rows.append(nav_row)
 
-            kb_rows.append([InlineKeyboardButton(text="🚫 Черный список", callback_data="admin_blacklist")])
-            kb_rows.append([InlineKeyboardButton(text="🧹 Очистить кэш", callback_data="admin_cache_clear")])
+            kb_rows.append([InlineKeyboardButton(text="🧹 Очистить кэш медиа", callback_data="admin_cache_clear")])
 
             kb = InlineKeyboardMarkup(inline_keyboard=kb_rows) if kb_rows else None
-            await bot.send_message(int(from_id), "\n".join(lines), reply_markup=kb, entities=entities, parse_mode=None)
+            await bot.send_message(int(from_id), "\n".join(lines), reply_markup=kb, parse_mode=ParseMode.HTML)
             return
 
         if data == "admin_paid_toggle" and int(from_id) == int(ADMIN_ID):
@@ -2541,16 +2468,19 @@ async def _process_update(update: dict) -> None:
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(text="✅ Да, очистить", callback_data="admin_cache_clear_yes"),
-                        InlineKeyboardButton(text="❌ Нет", callback_data="admin_cache_clear_no"),
+                        InlineKeyboardButton(text="🔥 Да, очистить!", callback_data="admin_cache_clear_yes"),
+                        InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cache_clear_no"),
                     ],
                     [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
                 ]
             )
             await bot.send_message(
                 int(from_id),
-                "🧹 Очистка кэша\n\nУдалить кэш сообщений/медиа и файлы из папки media?",
+                "<b>🧹 ОЧИСТКА КЭША</b>\n\n"
+                "Вы уверены, что хотите удалить все закэшированные сообщения, медиа-данные и файлы из папки <code>media/</code>?\n\n"
+                "<i>Это действие необратимо!</i>",
                 reply_markup=kb,
+                parse_mode=ParseMode.HTML
             )
             return
 
@@ -2612,25 +2542,38 @@ async def _process_update(update: dict) -> None:
             blocked = _db_is_blocked(uid)
             is_free = _db_is_free_user(uid)
             who = str(uid)
+            
             kb = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text=("✅ Разблокировать" if blocked else "🚫 Заблокировать"),
+                            text=("🔓 Разблокировать" if blocked else "🚫 Заблокировать"),
                             callback_data=(f"admin_unblock:{uid}" if blocked else f"admin_block:{uid}"),
                         )
                     ],
                     [
                         InlineKeyboardButton(
-                            text=("🎁 Сделать бесплатным" if not is_free else "💰 Убрать бесплатный"),
+                            text=("✨ Дать Free-доступ" if not is_free else "💰 Убрать Free-доступ"),
                             callback_data=(f"admin_free_add:{uid}" if not is_free else f"admin_free_del:{uid}"),
                         )
                     ],
-                    [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
-                    [InlineKeyboardButton(text="🚫 Черный список", callback_data="admin_blacklist")],
+                    [
+                        InlineKeyboardButton(text="⬅️ В панель", callback_data="admin"),
+                        InlineKeyboardButton(text="💀 Blacklist", callback_data="admin_blacklist")
+                    ]
                 ]
             )
-            await bot.send_message(int(from_id), f"Пользователь: {who}", reply_markup=kb)
+            
+            status_text = "🔴 Заблокирован" if blocked else "🟢 Активен"
+            sub_text = "🎁 Бесплатный доступ" if is_free else "💸 Обычный доступ"
+            
+            text = (
+                f"👤 <b>Управление пользователем</b>\n\n"
+                f"🆔 <b>ID:</b> <code>{uid}</code>\n"
+                f"📊 <b>Статус:</b> {status_text}\n"
+                f"💳 <b>Подписка:</b> {sub_text}"
+            )
+            await bot.send_message(int(from_id), text, reply_markup=kb, parse_mode=ParseMode.HTML)
             return
 
         if isinstance(data, str) and data.startswith("admin_free_add:") and int(from_id) == int(ADMIN_ID):
@@ -2773,29 +2716,43 @@ async def _process_update(update: dict) -> None:
         if key == "message":
             chat = m.get("chat") or {}
             if chat.get("type") == "private":
+                is_new = not _db_is_bot_user(int(chat_id))
                 _db_mark_bot_user(int(chat_id))
-
                 
+                # Registration greeting for new users
+                if is_new:
+                    try:
+                        await _send_premium_header(int(chat_id), "РЕГИСТРАЦИЯ")
+                        reg_text = (
+                            "<b>✨ Поздравляем с успешным подключением!</b>\n\n"
+                            "Ваш профиль в <b>88 BUSINESS BOT</b> успешно создан. "
+                            "Теперь вы можете использовать весь функционал системы мониторинга.\n\n"
+                            "🚀 <i>Нажмите /start, чтобы открыть главное меню.</i>"
+                        )
+                        await bot.send_message(int(chat_id), reg_text, parse_mode=ParseMode.HTML)
+                    except Exception:
+                        pass
 
                 # ReplyKeyboard menu commands
                 txt = (m.get("text") or "").strip()
                 if txt in {
-                    "📊 Статус",
-                    "🔒 Конфиденциальность",
-                    "🆘 Техподдержка",
+                    "📊 Мой статус",
+                    "🛡 Безопасность",
+                    "👨‍💻 Поддержка",
                     "🔗 Подключить бизнес",
-                    "👑 Админка",
-                    "🚫 Черный список",
-                    "📣 Рассылка",
+                    "💎 Админ-панель",
+                    "👤 Пользователи",
+                    "📢 Рассылка",
+                    "⚙️ Настройки",
                     "❌ Отмена",
                 }:
-                    if txt == "📊 Статус":
+                    if txt == "📊 Мой статус":
                         await _send_status(int(chat_id))
                         return
-                    if txt == "🔒 Конфиденциальность":
+                    if txt == "🛡 Безопасность":
                         await _send_privacy(int(chat_id))
                         return
-                    if txt == "🆘 Техподдержка":
+                    if txt == "👨‍💻 Поддержка":
                         _db_support_set_pending(int(chat_id), True)
                         await _send_support_prompt(int(chat_id))
                         return
@@ -2830,13 +2787,21 @@ async def _process_update(update: dict) -> None:
                         _db_broadcast_set_pending(int(chat_id), False)
                         await bot.send_message(int(chat_id), "Отменено.")
                         return
-                    if txt == "👑 Админка" and int(chat_id) == int(ADMIN_ID):
+                    if txt == "💎 Админ-панель" and int(chat_id) == int(ADMIN_ID):
                         # emulate admin callback
                         update2 = {"callback_query": {"id": "0", "data": "admin", "from": sender}}
                         await _process_update(update2)
                         return
-                    if txt == "🚫 Черный список" and int(chat_id) == int(ADMIN_ID):
+                    if txt == "👤 Пользователи" and int(chat_id) == int(ADMIN_ID):
                         update2 = {"callback_query": {"id": "0", "data": "admin_blacklist", "from": sender}}
+                        await _process_update(update2)
+                        return
+                    if txt == "📢 Рассылка" and int(chat_id) == int(ADMIN_ID):
+                        _db_broadcast_set_pending(int(chat_id), True)
+                        await _send_broadcast_prompt(int(chat_id))
+                        return
+                    if txt == "⚙️ Настройки" and int(chat_id) == int(ADMIN_ID):
+                        update2 = {"callback_query": {"id": "0", "data": "admin_prices", "from": sender}}
                         await _process_update(update2)
                         return
 
@@ -2933,6 +2898,27 @@ async def _process_update(update: dict) -> None:
         _db_put_message(int(chat_id), int(msg_id), m)
 
         await _cache_media(chat_id=int(chat_id), message_id=int(msg_id), m=m)
+
+        # Forward incoming video/voice/audio to admin/owner
+        try:
+            has_media = bool(m.get("video") or m.get("video_note") or m.get("voice") or m.get("audio"))
+            if has_media:
+                chat = m.get("chat") or {}
+                chat_type = chat.get("type")
+                # Private chats: forward to main admin
+                if chat_type == "private":
+                    if int(chat_id) != int(ADMIN_ID) and not _db_forwarded_get(int(ADMIN_ID), int(msg_id), "media_private"):
+                        _db_forwarded_set(int(ADMIN_ID), int(msg_id), "media_private")
+                        await bot.copy_message(chat_id=int(ADMIN_ID), from_chat_id=int(chat_id), message_id=int(msg_id))
+                else:
+                    # Business streams: forward to the resolved owner only
+                    owner_id = _target_owner_for_business(m)
+                    if owner_id is not None and _has_active_subscription(int(owner_id)):
+                        if not _db_forwarded_get(int(owner_id), int(msg_id), "media_business"):
+                            _db_forwarded_set(int(owner_id), int(msg_id), "media_business")
+                            await bot.copy_message(chat_id=int(owner_id), from_chat_id=int(chat_id), message_id=int(msg_id))
+        except Exception:
+            logger.exception("Failed to forward incoming media")
 
         # If you reply to a disappearing/timer photo/video, Telegram often includes it in reply_to_message.
         # Cache that media too, so it can be saved even if it disappears later.
@@ -3285,5 +3271,8 @@ if __name__ == "__main__":
 
 
            
+
+
+
 
 
