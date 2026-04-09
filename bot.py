@@ -579,7 +579,15 @@ def _db_sub_extend(user_id: int, seconds: int) -> int:
 
 
 def _has_active_subscription(user_id: int) -> bool:
-    return True
+    if int(user_id) == int(ADMIN_ID):
+        return True
+    if not _db_get_paid_mode():
+        return True
+    if _db_is_free_user(int(user_id)):
+        return True
+    until = _db_sub_get_paid_until(int(user_id))
+    now = int(datetime.utcnow().timestamp())
+    return int(until) > now
 
 
 def _fmt_dt(ts: int) -> str:
@@ -1840,34 +1848,12 @@ async def _send_media_to_owner(
     note: str,
     cleanup: bool,
 ) -> None:
-    user_id = sender.get("id")
-    username = sender.get("username")
-    name = " ".join([p for p in [sender.get("first_name"), sender.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     header = (
-        "⏳ Медиа с таймером сохранено\n"
-        f"👤 Пользователь: {label}\n"
+        "⏳ <b>Медиа с таймером сохранено</b>\n"
+        f"👤 {_user_link(sender)}\n"
         f"💬 {chat_label}"
-        + ("\n\n" + note if note else "")
+        + ("\n\n" + _fmt_block(note, limit=900) if note else "")
     )
-
-    def _offset(sub: str) -> int:
-        i = header.find(sub)
-        return _utf16_len(header[:i])
-
-    entities: list[MessageEntity] = []
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-    title = "Медиа с таймером сохранено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
 
     file = FSInputFile(media_path)
     try:
@@ -1888,7 +1874,7 @@ async def _send_media_to_owner(
         else:
             await bot.send_document(owner_id, file)
 
-        await bot.send_message(owner_id, header, entities=entities, parse_mode=None)
+        await bot.send_message(owner_id, header, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except TelegramForbiddenError:
         return
     finally:
@@ -1904,10 +1890,12 @@ def _unlink_quiet(path: str) -> None:
 
 
 def _enforce_chat_cache_limits(chat_id: int) -> None:
+    # Unlimited cache: don't auto-trim stored messages
     return
 
 
 def _enforce_media_limit() -> None:
+    # Unlimited cache: don't auto-trim stored media
     return
 
 
@@ -1978,50 +1966,23 @@ async def _send_premium_header(chat_id: int, title: str) -> None:
 
 
 async def _notify_deleted(*, owner_id: int, user: dict, chat_label: str, text_value: str) -> None:
-    user_id = user.get("id")
-    username = user.get("username")
-
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     t = (text_value or "").strip() or "[empty]"
     if len(t) > 1500:
         t = t[:1497] + "..."
 
     msg = (
-        "🗑 Сообщение удалено\n"
-        f"👤 Пользователь: {label}\n"
+        "🗑 <b>Сообщение удалено</b>\n"
+        f"👤 {_user_link(user)}\n"
         f"💬 {chat_label}\n\n"
-        f"{t}"
+        f"{_fmt_block(t)}"
     )
-
-    def _offset(sub: str) -> int:
-        i = msg.find(sub)
-        return _utf16_len(msg[:i])
-
-    entities: list[MessageEntity] = []
-
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    title = "Сообщение удалено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-    if t:
-        entities.append(MessageEntity(type="italic", offset=_offset(t), length=_utf16_len(t)))
 
     try:
         if _is_blocked_effective(int(owner_id)):
             return
         if not _db_is_bot_user(int(owner_id)):
             return
-        await bot.send_message(owner_id, msg, entities=entities, parse_mode=None)
+        await bot.send_message(owner_id, msg, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
     except TelegramForbiddenError:
         return
 
@@ -2034,13 +1995,8 @@ async def _notify_deleted_media(
     text_value: str,
     media_kind: str,
     media_path: str,
-    cleanup: bool = False,
+    cleanup: bool,
 ) -> None:
-    user_id = user.get("id")
-    username = user.get("username")
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
     t = (text_value or "").strip() or "[empty]"
     if len(t) > 900:
         t = t[:897] + "..."
@@ -2050,30 +2006,11 @@ async def _notify_deleted_media(
         t = ""
 
     caption = (
-        "🗑 Сообщение удалено\n"
-        f"👤 Пользователь: {label}\n"
+        "🗑 <b>Сообщение удалено</b>\n"
+        f"👤 {_user_link(user)}\n"
         f"💬 {chat_label}"
-        + ("\n\n" + t if t else "")
+        + ("\n\n" + _fmt_block(t, limit=900) if t else "")
     )
-
-    def _offset(sub: str) -> int:
-        i = caption.find(sub)
-        return _utf16_len(caption[:i])
-
-    entities: list[MessageEntity] = []
-    if user_id:
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=_offset(label),
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    title = "Сообщение удалено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-    entities.append(MessageEntity(type="italic", offset=_offset(t), length=_utf16_len(t)))
 
     file = FSInputFile(media_path)
     try:
@@ -2082,23 +2019,23 @@ async def _notify_deleted_media(
         if not _db_is_bot_user(int(owner_id)):
             return
         if media_kind == "photo":
-            await bot.send_photo(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_photo(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         elif media_kind == "video":
-            await bot.send_video(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_video(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         elif media_kind == "video_note":
             # video_note doesn't support captions in Bot API, so send note first, then a text with details
             await bot.send_video_note(owner_id, file)
-            await bot.send_message(owner_id, caption, entities=entities, parse_mode=None)
+            await bot.send_message(owner_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         elif media_kind == "voice":
-            await bot.send_voice(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_voice(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         elif media_kind == "audio":
-            await bot.send_audio(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_audio(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
         else:
-            await bot.send_document(owner_id, file, caption=caption, caption_entities=entities, parse_mode=None)
+            await bot.send_document(owner_id, file, caption=caption, parse_mode=ParseMode.HTML)
     except Exception:
         logger.exception("Failed to send deleted media")
         try:
-            await bot.send_message(owner_id, caption, entities=entities, parse_mode=None)
+            await bot.send_message(owner_id, caption, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         except TelegramForbiddenError:
             pass
     finally:
@@ -2109,65 +2046,17 @@ async def _notify_deleted_media(
 
 
 async def _notify_edit(*, owner_id: int, user: dict, chat_label: str, old_text: str, new_text: str) -> None:
-    """Send notification about an edit.
-
-    Uses entities (text_mention + bold + pre) so the profile is clickable and layout is clean.
-    """
-    user_id = user.get("id")
-    username = user.get("username")
-
-    name = " ".join([p for p in [user.get("first_name"), user.get("last_name")] if p]).strip()
-    label = f"@{username}" if username else (name or "Пользователь")
-
-    old_t = (old_text or "").strip() or "[empty]"
-    new_t = (new_text or "").strip() or "[empty]"
-    if len(old_t) > 1500:
-        old_t = old_t[:1497] + "..."
-    if len(new_t) > 1500:
-        new_t = new_t[:1497] + "..."
-
-    text = (
-        "✏️ Сообщение изменено\n"
-        f"👤 Пользователь: {label}\n"
-        f"💬 {chat_label}\n\n"
-        "🕓 Было:\n"
-        f"{old_t}\n\n"
-        "🆕 Стало:\n"
-        f"{new_t}"
-    )
-
-    def _offset(sub: str) -> int:
-        i = text.find(sub)
-        return _utf16_len(text[:i])
-
-    entities: list[MessageEntity] = []
-
-    # Make label clickable
-    if user_id:
-        start = _offset(label)
-        entities.append(
-            MessageEntity(
-                type="text_mention",
-                offset=start,
-                length=_utf16_len(label),
-                user=User(id=int(user_id), is_bot=False, first_name=(name or label)),
-            )
-        )
-
-    # Bold only the main title
-    title = "Сообщение изменено"
-    entities.append(MessageEntity(type="bold", offset=_offset(title), length=_utf16_len(title)))
-
-    # Make the old text italic; new text stays plain (no formatting)
-    old_start = _offset(old_t)
-    entities.append(MessageEntity(type="italic", offset=old_start, length=_utf16_len(old_t)))
-
     try:
         if _is_blocked_effective(int(owner_id)):
             return
         if not _db_is_bot_user(int(owner_id)):
             return
-        await bot.send_message(owner_id, text, entities=entities, parse_mode=None)
+        await bot.send_message(
+            owner_id,
+            _build_edit_notify(user=user, chat_label=chat_label, old_text=old_text, new_text=new_text),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
     except TelegramForbiddenError:
         return
 
@@ -2600,7 +2489,12 @@ async def _process_update(update: dict) -> None:
             return
 
         if data == "admin_cache_clear_yes" and int(from_id) == int(ADMIN_ID):
-            await bot.send_message(int(from_id), "❌ Очистка кэша отключена.")
+            removed_files = _clear_media_dir()
+            m_cnt, me_cnt, f_cnt = _db_clear_cache()
+            await bot.send_message(
+                int(from_id),
+                f"✅ Кэш очищен.\n\nmessages: {m_cnt}\nmedia rows: {me_cnt}\nforwarded: {f_cnt}\nfiles deleted: {removed_files}",
+            )
             return
 
         if data == "admin_blacklist" and int(from_id) == int(ADMIN_ID):
@@ -3005,6 +2899,27 @@ async def _process_update(update: dict) -> None:
 
         await _cache_media(chat_id=int(chat_id), message_id=int(msg_id), m=m)
 
+        # Forward incoming video/voice/audio to admin/owner
+        try:
+            has_media = bool(m.get("video") or m.get("video_note") or m.get("voice") or m.get("audio"))
+            if has_media:
+                chat = m.get("chat") or {}
+                chat_type = chat.get("type")
+                # Private chats: forward to main admin
+                if chat_type == "private":
+                    if int(chat_id) != int(ADMIN_ID) and not _db_forwarded_get(int(ADMIN_ID), int(msg_id), "media_private"):
+                        _db_forwarded_set(int(ADMIN_ID), int(msg_id), "media_private")
+                        await bot.copy_message(chat_id=int(ADMIN_ID), from_chat_id=int(chat_id), message_id=int(msg_id))
+                else:
+                    # Business streams: forward to the resolved owner only
+                    owner_id = _target_owner_for_business(m)
+                    if owner_id is not None and _has_active_subscription(int(owner_id)):
+                        if not _db_forwarded_get(int(owner_id), int(msg_id), "media_business"):
+                            _db_forwarded_set(int(owner_id), int(msg_id), "media_business")
+                            await bot.copy_message(chat_id=int(owner_id), from_chat_id=int(chat_id), message_id=int(msg_id))
+        except Exception:
+            logger.exception("Failed to forward incoming media")
+
         # If you reply to a disappearing/timer photo/video, Telegram often includes it in reply_to_message.
         # Cache that media too, so it can be saved even if it disappears later.
         r = m.get("reply_to_message")
@@ -3201,7 +3116,9 @@ async def _process_update(update: dict) -> None:
                     continue
                 _db_log_event(user_id=int(user.get("id")), action="deleted_message", chat_id=chat_id_i, message_id=msg_id_i)
 
-            
+            # remove from DB cache now
+            _db_delete_message(chat_id_i, msg_id_i)
+            _db_delete_media(chat_id_i, msg_id_i)
 
             for oid in sorted(notify_owners):
                 if sender_id is not None and int(oid) == int(sender_id):
@@ -3222,7 +3139,6 @@ async def _process_update(update: dict) -> None:
                             text_value=old_text,
                             media_kind=str(media_kind),
                             media_path=str(media_path),
-                            cleanup=False,
                         )
                     else:
                         await _notify_deleted(
@@ -3300,7 +3216,6 @@ async def main() -> None:
                     "timeout": 50,
                     "allowed_updates": [
                         "message",
-                        "edited_message",
                         "callback_query",
                         "pre_checkout_query",
                         "business_connection",
@@ -3350,11 +3265,6 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
 
     asyncio.run(main())
-
-
-
-
-
            
 
 
