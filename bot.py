@@ -579,15 +579,7 @@ def _db_sub_extend(user_id: int, seconds: int) -> int:
 
 
 def _has_active_subscription(user_id: int) -> bool:
-    if int(user_id) == int(ADMIN_ID):
-        return True
-    if not _db_get_paid_mode():
-        return True
-    if _db_is_free_user(int(user_id)):
-        return True
-    until = _db_sub_get_paid_until(int(user_id))
-    now = int(datetime.utcnow().timestamp())
-    return int(until) > now
+    return True
 
 
 def _fmt_dt(ts: int) -> str:
@@ -3308,6 +3300,7 @@ async def main() -> None:
                     "timeout": 50,
                     "allowed_updates": [
                         "message",
+                        "edited_message",
                         "callback_query",
                         "pre_checkout_query",
                         "business_connection",
@@ -3358,6 +3351,11 @@ if __name__ == "__main__":
 
     asyncio.run(main())
 
+
+
+
+
+           
 
 
 
